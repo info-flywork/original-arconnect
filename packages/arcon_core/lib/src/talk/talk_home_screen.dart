@@ -17,12 +17,16 @@ import '../push/push_service.dart';
 import 'talk_ai_logo.dart';
 import 'talk_ai_screen.dart';
 import 'talk_controller.dart';
+import 'talk_events.dart';
+import 'talk_share_kinds.dart';
+import 'talk_info_screen.dart';
 import 'talk_icons.dart';
 import 'talk_media_composer.dart';
 import 'talk_models.dart';
 import 'talk_new_chat_screen.dart';
-import 'talk_pickers.dart';
+import 'talk_privacy.dart';
 import 'talk_profile_screen.dart';
+import 'talk_swipe.dart';
 import 'talk_theme.dart';
 import 'talk_widgets.dart';
 
@@ -45,6 +49,9 @@ class TalkHomeScreen extends StatefulWidget {
 
 class _TalkHomeScreenState extends State<TalkHomeScreen> {
   late final TalkController _c = TalkController(session: widget.session, baseUrl: widget.config.apiBase)..start();
+
+  @visibleForTesting
+  TalkController get controllerForTest => _c;
   final _search = TextEditingController();
   final _searchFocus = FocusNode();
   final Set<int> _sel = {};
@@ -248,6 +255,27 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
     ));
   }
 
+  /// "Kilitli sohbetler": Face ID / parmak izi ile açılır
+  Future<void> _openLocked() async {
+    if (!await talkUnlock(context) || !mounted) return;
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => _ArchivedPage(
+        controller: _c,
+        locked: true,
+        onOpen: (ch) => _open(ch),
+        onUnarchive: (ch) => _c.toggleLock(ch.id),
+      ),
+    ));
+  }
+
+  /// Kilitle / kilidi aç: her iki yönde de doğrulama ister
+  Future<void> _toggleLock(TalkChannel ch) async {
+    final on = _c.locked.contains(ch.id);
+    if (!await talkUnlock(context, reason: on ? 'Sohbetin kilidini açmak için doğrula' : 'Sohbeti kilitlemek için doğrula') || !mounted) return;
+    await _c.toggleLock(ch.id);
+    if (mounted) talkToast(context, on ? 'Sohbetin kilidi açıldı' : 'Sohbet kilitlendi · Kilitli sohbetler\'de');
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = TalkColors.of(context);
@@ -269,7 +297,7 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
             builder: (context, _) => Stack(children: [
               Positioned.fill(
                 child: IndexedStack(index: _tab, children: [
-                  TalkCallsScreen(key: ValueKey(_callsKey), controller: _c, embedded: true),
+                  TalkCallsScreen(key: ValueKey(_callsKey), controller: _c, embedded: true, leading: _backToClub(c), onOpenChat: _openById),
                   _chatsTab(c),
                   _meTab(c),
                 ]),
@@ -297,6 +325,14 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
   // ---------- ortak parçalar ----------
 
   /// iOS 26 WhatsApp: yarı saydam yuvarlak üst butonlar
+  /// ARCON Club içinden açıldıysa (appMode: false) Club'a dönüş butonu
+  List<Widget> _backToClub(TalkColors c) => widget.appMode || !Navigator.of(context).canPop()
+      ? const []
+      : [
+          _circle(c, Icon(CupertinoIcons.chevron_left, size: 22, color: c.ink), () => Navigator.of(context).maybePop(), tip: 'Geri'),
+          const SizedBox(width: 10),
+        ];
+
   Widget _circle(TalkColors c, Widget child, VoidCallback? onTap, {String? tip, bool solid = false}) => Tooltip(
         message: tip ?? '',
         child: GestureDetector(
@@ -378,6 +414,7 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
                 ]),
               )
             : Row(children: [
+                ..._backToClub(c),
                 PopupMenuButton<String>(
                   tooltip: 'Diğer',
                   color: c.popBg,
@@ -389,25 +426,19 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
                         setState(() => _selecting = true);
                       case 'read':
                         await _readAll();
-                      case 'group':
-                        final id = await showNewGroupSheet(context, _c);
-                        if (mounted && id != null && id > 0) _openById(id);
-                      case 'archived':
-                        _openArchived();
                     }
                   },
                   itemBuilder: (_) => [
                     for (final (v, t, i) in [
-                      ('select', 'Sohbetleri seç', CupertinoIcons.checkmark_circle),
-                      ('read', 'Tümünü okundu say', CupertinoIcons.chat_bubble_2),
-                      ('group', 'Yeni grup', CupertinoIcons.person_3),
-                      ('archived', 'Arşivlenmiş', CupertinoIcons.archivebox),
+                      ('select', 'Sohbet seç', CupertinoIcons.checkmark_circle),
+                      ('read', 'Tümü okundu', CupertinoIcons.text_bubble),
                     ])
                       PopupMenuItem(
                         value: v,
                         child: Row(children: [
-                          Expanded(child: Text(t, style: talkText(16, FontWeight.w400, c.ink))),
-                          Icon(i, size: 20, color: c.ink),
+                          Icon(i, size: 22, color: c.ink),
+                          const SizedBox(width: 14),
+                          Text(t, style: talkText(17, FontWeight.w400, c.ink)),
                         ]),
                       ),
                   ],
@@ -423,6 +454,7 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
       _searchField(c, "ARCON AI'a sor veya ara", controller: _search, onChanged: _c.setQuery, focusNode: _searchFocus),
       _filters(c),
       if (q.isNotEmpty) _askAiRow(c, q),
+      if (_c.locked.isNotEmpty && q.isEmpty) _lockedRow(c),
       if (archived.isNotEmpty && q.isEmpty) _archivedRow(c, archived),
     ]);
 
@@ -471,7 +503,7 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
 
   Widget _row(TalkChannel ch, {VoidCallback? onLongPress}) {
     final selecting = _selecting && onLongPress == null;
-    return _ChanRow(
+    final row = _ChanRow(
       channel: ch,
       photoUrl: _c.api.fileUrl(ch.photo),
       typing: _typingLabel(ch),
@@ -484,6 +516,66 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
       onTap: () => selecting ? _toggleSel(ch.id) : _open(ch),
       onLongPress: onLongPress ?? () => _toggleSel(ch.id),
     );
+    // WhatsApp iOS: sola kaydır → "Diğer" (gri) ve "Arşivle"; arşiv listesinde ve seçimdeyken yok
+    return TalkSwipeActions(
+      key: ValueKey('swipe-${ch.id}'),
+      enabled: onLongPress == null && !_selecting,
+      actions: [
+        TalkSwipeAction(icon: Icons.more_horiz, label: 'Diğer', color: const Color(0xFF7C7C80), onTap: () => _moreSheet(ch)),
+        TalkSwipeAction(icon: CupertinoIcons.archivebox_fill, label: 'Arşivle', color: const Color(0xFF1C1C1E), onTap: () => _archiveOne(ch)),
+      ],
+      child: row,
+    );
+  }
+
+  Future<void> _archiveOne(TalkChannel ch) async {
+    await _c.toggleArchive(ch.id);
+    if (mounted) talkToast(context, 'Sohbet arşivlendi');
+  }
+
+  /// "Diğer": sessize al, favori, okundu, bilgi, sil
+  Future<void> _moreSheet(TalkChannel ch) async {
+    final muted = _c.muted.contains(ch.id);
+    final fav = _c.favourites.contains(ch.id);
+    final v = await showCupertinoModalPopup<String>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        title: Text(ch.name),
+        actions: [
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'mute'), child: Text(muted ? 'Sesi aç' : 'Sessize al')),
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'fav'), child: Text(fav ? 'Favorilerden çıkar' : 'Favorilere ekle')),
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'list'), child: const Text('Listeye ekle')),
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'lock'), child: const Text('Sohbeti kilitle')),
+          if (ch.unread > 0) CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'read'), child: const Text('Okundu olarak işaretle')),
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'info'), child: Text(ch.isDm ? 'Kişi bilgisi' : 'Grup bilgisi')),
+          CupertinoActionSheetAction(isDestructiveAction: true, onPressed: () => Navigator.pop(ctx, 'delete'), child: const Text('Sohbeti sil')),
+        ],
+        cancelButton: CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx), child: const Text('Vazgeç')),
+      ),
+    );
+    if (!mounted || v == null) return;
+    switch (v) {
+      case 'mute':
+        await _c.toggleMute(ch.id);
+      case 'fav':
+        await _c.toggleFavourite(ch.id);
+      case 'list':
+        await showTalkListSheet(context, _c, ch.id);
+      case 'lock':
+        await _toggleLock(ch);
+      case 'read':
+        _c.markRead(ch.id);
+        unawaited(_c.api.read(ch.id).then((_) {}, onError: (_) {}));
+      case 'info':
+        await Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) => TalkInfoScreen(controller: _c, channel: ch, session: widget.session, config: widget.config),
+        ));
+      case 'delete':
+        _sel
+          ..clear()
+          ..add(ch.id);
+        await _deleteSelected();
+    }
   }
 
   /// Grupta son mesajı yazanın adı: "Siz" / "Ali"
@@ -550,15 +642,38 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
     );
   }
 
+  Widget _lockedRow(TalkColors c) => GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _openLocked,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(36, 10, 20, 0),
+          child: Row(children: [
+            Icon(CupertinoIcons.lock, size: 24, color: c.muted),
+            const SizedBox(width: 30),
+            Expanded(
+              child: Container(
+                padding: const EdgeInsets.only(bottom: 12, top: 2),
+                decoration: BoxDecoration(border: Border(bottom: BorderSide(color: c.rowLine, width: 0.6))),
+                child: Row(children: [
+                  Expanded(child: Text('Kilitli sohbetler', style: talkText(17, FontWeight.w600, c.muted))),
+                  Text('${_c.locked.length}', style: talkText(15, FontWeight.w400, c.muted)),
+                ]),
+              ),
+            ),
+          ]),
+        ),
+      );
+
   /// Filtre çipleri: Tümü / Okunmamış / Favoriler / Gruplar
   Widget _filters(TalkColors c) {
     final unreadChats = _c.channels.where((ch) => ch.unread > 0 && !_c.archived.contains(ch.id)).length;
-    Widget chip(String label, TalkFilter f) {
-      final on = _c.filter == f;
+    Widget chip(String label, TalkFilter? f, {String? list, VoidCallback? onTap, VoidCallback? onLongPress}) {
+      final on = list != null ? _c.listFilter == list : (f != null && _c.listFilter == null && _c.filter == f);
       return Padding(
         padding: const EdgeInsets.only(right: 8),
         child: GestureDetector(
-          onTap: () => _c.setFilter(f),
+          onTap: onTap ?? () => list != null ? _c.setListFilter(on ? null : list) : _c.setFilter(f!),
+          onLongPress: onLongPress,
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
             decoration: BoxDecoration(
@@ -582,9 +697,25 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
           chip(unreadChats > 0 ? 'Okunmamış $unreadChats' : 'Okunmamış', TalkFilter.unread),
           chip('Favoriler', TalkFilter.favourites),
           chip('Gruplar', TalkFilter.groups),
+          // kullanıcının listeleri (basılı tut: listeyi sil)
+          for (final n in (_c.lists.keys.toList()..sort())) chip(n, null, list: n, onLongPress: () => _deleteList(n)),
+          chip('+', null, onTap: _newList),
         ],
       ),
     );
+  }
+
+  Future<void> _newList() async {
+    final n = await askTalkListName(context);
+    if (n == null || !mounted) return;
+    await _c.createList(n);
+    _c.setListFilter(n);
+    if (mounted) talkToast(context, '"$n" listesi oluşturuldu. Sohbeti sola kaydırıp Diğer › Listeye ekle.');
+  }
+
+  Future<void> _deleteList(String n) async {
+    final ok = await talkConfirm(context, title: '"$n" listesi silinsin mi?', message: 'Sohbetler silinmez, yalnızca liste kalkar.', ok: 'Sil');
+    if (ok) await _c.deleteList(n);
   }
 
   String _typingLabel(TalkChannel ch) {
@@ -740,6 +871,7 @@ class _TalkHomeScreenState extends State<TalkHomeScreen> {
       Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16),
         child: Row(children: [
+          ..._backToClub(c),
           _circle(c, const ArconAiLogo(size: 30), _openAi, tip: 'ARCON AI'),
           const Spacer(),
           _circle(c, Icon(CupertinoIcons.pencil, size: 22, color: c.ink), _openProfile, tip: 'Profili düzenle'),
@@ -824,9 +956,12 @@ class _AiButton extends StatelessWidget {
 }
 
 class _ArchivedPage extends StatelessWidget {
-  const _ArchivedPage({required this.controller, required this.onOpen, required this.onUnarchive});
+  const _ArchivedPage({required this.controller, required this.onOpen, required this.onUnarchive, this.locked = false});
 
   final TalkController controller;
+
+  /// true: "Kilitli sohbetler" (aynı görünüm, kilit açma işlemi)
+  final bool locked;
   final Future<void> Function(TalkChannel ch) onOpen;
   final Future<void> Function(TalkChannel ch) onUnarchive;
 
@@ -836,22 +971,25 @@ class _ArchivedPage extends StatelessWidget {
       listenable: controller,
       builder: (context, _) {
         final c = TalkColors.of(context);
-        final list = controller.archivedChannels;
+        final list = locked ? controller.lockedChannels : controller.archivedChannels;
         return Scaffold(
           backgroundColor: c.rail,
           appBar: AppBar(
             backgroundColor: c.rail,
             foregroundColor: c.ink,
-            title: Text('Arşivlenmiş', style: talkText(17, FontWeight.w600, c.ink)),
+            title: Text(locked ? 'Kilitli sohbetler' : 'Arşivlenmiş', style: talkText(17, FontWeight.w600, c.ink)),
             centerTitle: true,
           ),
           body: list.isEmpty
-              ? Center(child: Text('Arşivlenmiş sohbet yok', style: talkText(15, FontWeight.w400, c.muted)))
+              ? Center(child: Text(locked ? 'Kilitli sohbet yok' : 'Arşivlenmiş sohbet yok', style: talkText(15, FontWeight.w400, c.muted)))
               : ListView(
                   children: [
                     Padding(
                       padding: const EdgeInsets.fromLTRB(24, 8, 24, 12),
-                      child: Text('Bu sohbetler arşivde kalır. Çıkarmak için sohbete basılı tut.',
+                      child: Text(
+                          locked
+                              ? 'Bu sohbetler yalnızca bu telefonda kilitli ve ana listede görünmez. Kilidi açmak için sohbete basılı tut.'
+                              : 'Bu sohbetler arşivde kalır. Çıkarmak için sohbete basılı tut.',
                           textAlign: TextAlign.center, style: talkText(13, FontWeight.w400, c.muted)),
                     ),
                     for (final ch in list)
@@ -889,7 +1027,7 @@ class _ArchivedPage extends StatelessWidget {
       context: context,
       builder: (ctx) => CupertinoActionSheet(
         title: Text(ch.name),
-        actions: [CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, true), child: const Text('Arşivden çıkar'))],
+        actions: [CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, true), child: Text(locked ? 'Kilidi aç' : 'Arşivden çıkar'))],
         cancelButton: CupertinoActionSheetAction(isDefaultAction: true, onPressed: () => Navigator.pop(ctx), child: const Text('Vazgeç')),
       ),
     );
@@ -929,7 +1067,16 @@ class _ChanRow extends StatelessWidget {
     final c = TalkColors.of(context);
     final unread = channel.unread > 0;
     final call = talkCallLine(channel.lastBody);
-    final preview = call != null ? channel.lastBody.replaceFirst(RegExp(r'^(📞|🎥)\s*'), '') : channel.preview;
+    final event = call == null ? talkEventLine(channel.lastBody) : null;
+    final preview = call != null
+        ? channel.lastBody.replaceFirst(RegExp(r'^(📞|🎥)\s*'), '')
+        : event != null
+            ? '${event.title} · ${talkEventWhen(event.at)}'
+            : talkLocationLine(channel.lastBody) != null
+                ? 'Konum'
+                : talkPollLine(channel.lastBody) != null
+                    ? 'Anket: ${talkPollLine(channel.lastBody)!.question}'
+                    : channel.preview;
     final previewStyle = talkText(15, FontWeight.w400, c.muted, height: 1.33);
 
     final InlineSpan lead;

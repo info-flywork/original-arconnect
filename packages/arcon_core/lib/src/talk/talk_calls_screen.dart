@@ -1,22 +1,31 @@
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/api_client.dart';
 import 'talk_call_screen.dart';
 import 'talk_controller.dart';
+import 'talk_events.dart';
 import 'talk_models.dart';
 import 'talk_new_chat_screen.dart';
+import 'talk_swipe.dart';
 import 'talk_theme.dart';
 import 'talk_widgets.dart';
 
 /// WhatsApp iOS "Aramalar": büyük başlık, arama kutusu, hızlı butonlar ve "En Son" listesi.
 class TalkCallsScreen extends StatefulWidget {
-  const TalkCallsScreen({super.key, required this.controller, this.embedded = false});
+  const TalkCallsScreen({super.key, required this.controller, this.embedded = false, this.leading = const [], this.onOpenChat});
 
   final TalkController controller;
 
   /// Ana ekranın "Aramalar" sekmesinde: alttaki yüzen menüye yer bırakır.
   final bool embedded;
+
+  /// Başlığın solunda "…" düğmesinden önce (ARCON Club'a geri dönüş)
+  final List<Widget> leading;
+
+  /// "…" › Mesaj gönder: arama kaydının sohbetini aç (ana ekran)
+  final void Function(int channelId)? onOpenChat;
 
   @override
   State<TalkCallsScreen> createState() => _TalkCallsScreenState();
@@ -27,7 +36,11 @@ class _TalkCallsScreenState extends State<TalkCallsScreen> {
   String? _error;
   String _q = '';
 
+  /// Silinen arama kayıtları (yalnızca bu telefonda gizlenir)
+  Set<int> _hidden = {};
+
   TalkController get _c => widget.controller;
+  String get _hiddenKey => 'arcon_talk_hidden_calls_${_c.me?.id ?? 0}';
 
   @override
   void initState() {
@@ -35,8 +48,64 @@ class _TalkCallsScreenState extends State<TalkCallsScreen> {
     _load();
   }
 
+  Future<void> _hide(TalkCallLog l) async {
+    setState(() => _hidden.add(l.id));
+    final p = await SharedPreferences.getInstance();
+    await p.setStringList(_hiddenKey, _hidden.map((e) => '$e').toList());
+  }
+
+  /// "…": geri ara, görüntülü ara, sohbete git
+  Future<void> _more(TalkCallLog l) async {
+    final v = await showCupertinoModalPopup<String>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        title: Text(l.name),
+        actions: [
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'voice'), child: const Text('Sesli ara')),
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'video'), child: const Text('Görüntülü ara')),
+          if (widget.onOpenChat != null)
+            CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'chat'), child: const Text('Mesaj gönder')),
+          CupertinoActionSheetAction(isDestructiveAction: true, onPressed: () => Navigator.pop(ctx, 'delete'), child: const Text('Kaydı sil')),
+        ],
+        cancelButton: CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx), child: const Text('Vazgeç')),
+      ),
+    );
+    if (!mounted || v == null) return;
+    switch (v) {
+      case 'voice':
+        await _callBack(l, video: false);
+      case 'video':
+        await _callBack(l, video: true);
+      case 'chat':
+        widget.onOpenChat?.call(l.channelId);
+      case 'delete':
+        await _hide(l);
+    }
+  }
+
+  /// WhatsApp "Planla": kişi seç → sesli/görüntülü + zaman → sohbete planlı arama kartı
+  Future<void> _plan() async {
+    final u = await Navigator.of(context).push<TalkUser>(MaterialPageRoute(
+      builder: (_) => TalkUserPickerScreen(controller: _c, title: 'Arama planla'),
+    ));
+    if (u == null || !mounted) return;
+    final e = await showTalkEventSheet(context, call: true);
+    if (e == null || !mounted) return;
+    try {
+      final ch = await _c.api.openDm(u.id);
+      if (ch == null || !mounted) return;
+      _c.upsertChannel(ch);
+      await _c.api.sendMessage(channelId: ch.id, body: talkEventBody(e.title, e.at));
+      if (mounted) talkToast(context, '${talkFirstName(u.displayName)} ile arama planlandı · ${talkEventWhen(e.at)}');
+    } on ArconApiException catch (err) {
+      if (mounted) talkToast(context, err.message.isEmpty ? 'Planlanamadı' : err.message, error: true);
+    }
+  }
+
   Future<void> _load() async {
     try {
+      final p = await SharedPreferences.getInstance();
+      _hidden = (p.getStringList(_hiddenKey) ?? const []).map(int.parse).toSet();
       final list = await _c.api.callHistory();
       if (mounted) setState(() => _calls = list);
     } on ArconApiException catch (e) {
@@ -103,7 +172,7 @@ class _TalkCallsScreenState extends State<TalkCallsScreen> {
     final c = TalkColors.of(context);
     final top = MediaQuery.paddingOf(context).top;
     final q = _q.trim().toLowerCase();
-    final calls = (_calls ?? const <TalkCallLog>[]).where((l) => q.isEmpty || l.name.toLowerCase().contains(q)).toList();
+    final calls = (_calls ?? const <TalkCallLog>[]).where((l) => !_hidden.contains(l.id) && (q.isEmpty || l.name.toLowerCase().contains(q))).toList();
 
     Widget circle(Widget child, VoidCallback onTap, {bool solid = false, String tip = ''}) => Tooltip(
           message: tip,
@@ -146,6 +215,7 @@ class _TalkCallsScreenState extends State<TalkCallsScreen> {
       Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16),
         child: Row(children: [
+          ...widget.leading,
           PopupMenuButton<String>(
             tooltip: 'Diğer',
             color: c.popBg,
@@ -206,6 +276,7 @@ class _TalkCallsScreenState extends State<TalkCallsScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 12),
         child: Row(children: [
           quick(CupertinoIcons.phone, 'Ara', () => _newCall(video: false)),
+          quick(CupertinoIcons.calendar, 'Planla', _plan),
           quick(CupertinoIcons.video_camera, 'Görüntülü', () => _newCall(video: true)),
           quick(CupertinoIcons.heart, 'Favoriler', () => _newCall(video: false, favourites: true)),
         ]),
@@ -259,7 +330,17 @@ class _TalkCallsScreenState extends State<TalkCallsScreen> {
     );
   }
 
-  Widget _row(TalkColors c, TalkCallLog l) {
+  Widget _row(TalkColors c, TalkCallLog l) => TalkSwipeActions(
+        key: ValueKey('call-${l.id}'),
+        actionWidth: 76,
+        actions: [
+          TalkSwipeAction(icon: Icons.more_horiz, tooltip: 'Diğer', color: const Color(0xFF7C7C80), onTap: () => _more(l)),
+          TalkSwipeAction(icon: CupertinoIcons.trash_fill, tooltip: 'Sil', color: TalkColors.dangerSolid, onTap: () => _hide(l)),
+        ],
+        child: _rowBody(c, l),
+      );
+
+  Widget _rowBody(TalkColors c, TalkCallLog l) {
     final red = l.missed && !l.outgoing;
     final kind = l.outgoing ? 'Giden' : (l.missed ? 'Cevapsız' : 'Gelen');
     return InkWell(

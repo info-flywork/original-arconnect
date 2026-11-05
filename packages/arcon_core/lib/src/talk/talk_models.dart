@@ -240,6 +240,9 @@ class TalkSidebar {
   String get avatarPath => _s(channel['avatar_path']);
   bool get isDm => _s(channel['type']) == 'dm';
   int get disappearSec => _i(channel['disappear_after_sec']);
+
+  /// Kısıtlı sohbet: mesajlar başka sohbete iletilemez, sohbet dışa aktarılamaz
+  bool get restricted => _b(channel['restricted']);
   String get disappearLabel =>
       _s(channel['disappear_label']).isNotEmpty ? _s(channel['disappear_label']) : (disappearPresets[disappearSec] ?? 'Kapalı');
 }

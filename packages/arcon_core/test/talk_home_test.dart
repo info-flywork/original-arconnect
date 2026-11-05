@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:arcon_core/arcon_core.dart';
+import 'package:arcon_core/src/talk/talk_controller.dart';
 import 'package:arcon_core/src/talk/talk_home_screen.dart';
 import 'package:arcon_core/src/ui/theme_scope.dart';
 import 'package:flutter/material.dart';
@@ -28,7 +29,8 @@ final _boot = {
   ],
 };
 
-Future<void> pumpHome(WidgetTester t, {bool dark = false}) async {
+/// [club]: ARCON Club menüsünden açılmış gibi (altında Club sayfası, appMode: false)
+Future<void> pumpHome(WidgetTester t, {bool dark = false, bool club = false}) async {
   SharedPreferences.setMockInitialValues({'arcon-theme': dark ? 'dark' : 'light'});
   final client = MockClient((req) async {
     final a = req.url.queryParameters['action'] ?? req.url.path;
@@ -46,17 +48,34 @@ Future<void> pumpHome(WidgetTester t, {bool dark = false}) async {
         'delivered_upto': _ago(const Duration(minutes: 1)),
       });
     }
-    if (a.contains('call_history')) return _json({'ok': true, 'calls': []});
+    if (a.contains('call_history')) {
+      return _json({
+        'ok': true,
+        'calls': [
+          {'id': 91, 'channel_id': 5, 'video': 1, 'outgoing': 0, 'missed': 1, 'created_at': _ago(const Duration(days: 1)), 'name': 'Furkan', 'is_dm': 1},
+        ],
+      });
+    }
     return _json({'ok': false, 'error': {'code': 'x', 'message': 'x'}}, 500);
   });
   final session = SessionController(api: ArconApi(baseUrl: 'https://x.test/app/', appKey: 'arconnect', client: client, token: 'arc_t'), store: MemoryTokenStore());
   final theme = ArconThemeController()..value = dark ? ThemeMode.dark : ThemeMode.light;
+  final talk = TalkHomeScreen(
+    session: session,
+    appMode: !club,
+    config: const ArconAppConfig(appKey: 'arconnect', title: 'ARCONNECT', apiBase: 'https://x.test/app/'),
+  );
   // TalkApi kendi http.Client'ını kurar: kurulum anında sahte istemciyi verelim
   await http.runWithClient(() => t.pumpWidget(ArconThemeScope(
     controller: theme,
     child: MaterialApp(
       theme: ThemeData(brightness: dark ? Brightness.dark : Brightness.light),
-      home: TalkHomeScreen(session: session, config: const ArconAppConfig(appKey: 'arconnect', title: 'ARCONNECT', apiBase: 'https://x.test/app/')),
+      // Club: "/" Club sayfası, üstünde "/talk" (Club menüsünden açılmış gibi)
+      initialRoute: club ? '/talk' : '/',
+      routes: {
+        '/': (_) => club ? const Scaffold(body: Text('Club ana sayfa')) : talk,
+        if (club) '/talk': (_) => talk,
+      },
     ),
   )), () => client);
   await t.pump(const Duration(milliseconds: 300));
@@ -80,6 +99,19 @@ void main() {
     expect(find.text('Flywork Rapor Grubu'), findsOneWidget);
     expect(find.textContaining('Cevapsız sesli arama'), findsOneWidget);
     expect(find.textContaining('Siz: '), findsOneWidget); // grupta son mesaj benim
+    await close(t);
+  });
+
+  testWidgets("ARCON Club içinden açılınca Geri butonu Club'a döner; ARCONNECT uygulamasında yok", (t) async {
+    await pumpHome(t);
+    expect(find.byTooltip('Geri'), findsNothing);
+    await close(t);
+
+    await pumpHome(t, club: true);
+    expect(find.byTooltip('Geri'), findsOneWidget);
+    await t.tap(find.byTooltip('Geri'));
+    await t.pumpAndSettle();
+    expect(find.text('Club ana sayfa'), findsOneWidget);
     await close(t);
   });
 
@@ -139,11 +171,78 @@ void main() {
     await t.tap(find.byTooltip('Yeni sohbet'));
     await t.pumpAndSettle();
     expect(find.text('Yeni sohbet'), findsOneWidget);
-    expect(find.text('2 kişi'), findsOneWidget);
-    expect(find.text('Yeni grup'), findsOneWidget);
+    // WhatsApp iOS: topluluk hariç işlemler, sık görüşülenler, harf bölümleri
+    for (final s in ['Yeni grup', 'Yeni kişi', 'Yeni toplu mesaj', 'Yeni etkinlik', 'Sık görüşülenler', "ARCONNECT'teki kişiler"]) {
+      expect(find.text(s), findsOneWidget, reason: s);
+    }
+    // harf bölümü başlığı + sağdaki dizin
+    expect(find.text('E'), findsNWidgets(2));
+    expect(find.text('F'), findsNWidgets(2));
+    expect(find.text('Yeni topluluk'), findsNothing);
     expect(find.text('Müsait'), findsOneWidget);
     expect(find.text('Sena Yılmaz (Siz)'), findsOneWidget);
     expect(find.text('Kendinize mesaj gönderin'), findsOneWidget);
+    await close(t);
+  });
+
+  testWidgets('… menüsünde yalnızca Sohbet seç ve Tümü okundu var', (t) async {
+    await pumpHome(t);
+    await t.tap(find.byTooltip('Diğer').first);
+    await t.pumpAndSettle();
+    expect(find.text('Sohbet seç'), findsOneWidget);
+    expect(find.text('Tümü okundu'), findsOneWidget);
+    expect(find.byType(PopupMenuItem<String>), findsNWidgets(2));
+    await t.tap(find.text('Tümü okundu'));
+    await t.pumpAndSettle();
+    expect(find.text('Okunmamış 1'), findsNothing); // okunmamış sayacı sıfırlandı
+    await close(t);
+  });
+
+  testWidgets('sola kaydırınca Diğer ve Arşivle çıkar; Arşivle sohbeti arşive alır', (t) async {
+    await pumpHome(t);
+    await t.drag(find.text('Emrah'), const Offset(-300, 0));
+    await t.pumpAndSettle();
+    expect(find.text('Diğer'), findsOneWidget);
+    expect(find.text('Arşivle'), findsOneWidget);
+    await t.tap(find.text('Arşivle'));
+    await t.pumpAndSettle();
+    expect(find.text('Emrah'), findsNothing);
+    expect(find.text('Arşivlenmiş'), findsOneWidget);
+    await close(t);
+  });
+
+  testWidgets('aramayı sola kaydırınca … ve sil çıkar; sil kaydı listeden kaldırır', (t) async {
+    await pumpHome(t);
+    await t.tap(find.text('Aramalar'));
+    await t.pump();
+    await t.pump(const Duration(milliseconds: 500));
+    expect(find.text('Cevapsız'), findsOneWidget);
+    await t.drag(find.text('Cevapsız'), const Offset(-300, 0));
+    await t.pumpAndSettle();
+    expect(find.byTooltip('Sil'), findsOneWidget);
+    await t.tap(find.byTooltip('Sil'));
+    await t.pumpAndSettle();
+    expect(find.text('Cevapsız'), findsNothing);
+    expect(find.text('Henüz arama yok'), findsOneWidget);
+    await close(t);
+  });
+
+  testWidgets('özel liste çipi listeyi süzer; kilitli sohbet listede görünmez', (t) async {
+    await pumpHome(t);
+    final state = t.state(find.byType(TalkHomeScreen)) as dynamic;
+    final ctl = state.controllerForTest as TalkController;
+    await ctl.toggleInList('İş', 4); // Emrah
+    await t.pump();
+    expect(find.text('İş'), findsOneWidget);
+    await t.tap(find.text('İş'));
+    await t.pump();
+    expect(find.text('Emrah'), findsOneWidget);
+    expect(find.text('Flywork Rapor Grubu'), findsNothing);
+    await t.tap(find.text('Tümü'));
+    await ctl.toggleLock(4);
+    await t.pump();
+    expect(find.text('Emrah'), findsNothing);
+    expect(find.text('Kilitli sohbetler'), findsOneWidget);
     await close(t);
   });
 
@@ -153,7 +252,9 @@ void main() {
     await t.pump();
     await t.pump(const Duration(milliseconds: 500));
     expect(find.text('En Son'), findsOneWidget);
-    expect(find.text('Görüntülü'), findsOneWidget);
+    for (final s in ['Ara', 'Planla', 'Görüntülü', 'Favoriler']) {
+      expect(find.text(s), findsOneWidget, reason: s);
+    }
     await t.tap(find.text('Siz'));
     await t.pump();
     await t.pump(const Duration(milliseconds: 500));

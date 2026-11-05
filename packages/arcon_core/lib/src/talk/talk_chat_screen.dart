@@ -19,6 +19,8 @@ import '../push/local_notifier.dart';
 import 'talk_call_screen.dart';
 import 'talk_contact_sheet.dart';
 import 'talk_controller.dart';
+import 'talk_events.dart';
+import 'talk_share_kinds.dart';
 import 'talk_icons.dart';
 import 'talk_info_screen.dart';
 import 'talk_media_composer.dart';
@@ -400,50 +402,117 @@ class _TalkChatScreenState extends State<TalkChatScreen> {
   }
 
   /// WhatsApp iOS "+" menüsü: Fotoğraflar, Kamera, Belge, Kişi
+  /// WhatsApp iOS ek menüsü: Fotoğraflar, Kamera, Konum, Kişi, Belge, Anket, Etkinlik; altta galerideki son fotoğraflar
   Future<void> _attach() async {
     setState(() => _pop = null);
     _focus.unfocus();
     final c = TalkColors.of(context);
     final choice = await showModalBottomSheet<String>(
       context: context,
+      isScrollControlled: true,
       backgroundColor: c.dark ? const Color(0xFF1C1C1E) : const Color(0xFFF2F2F7),
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
       showDragHandle: true,
       builder: (ctx) {
-        Widget item(String key, IconData icon, String label) => Expanded(
+        Widget item(String key, IconData icon, Color color, String label) => Expanded(
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: () => Navigator.pop(ctx, key),
                 child: Column(children: [
                   Container(
-                    width: 64,
-                    height: 64,
+                    width: 50,
+                    height: 50,
                     decoration: BoxDecoration(color: c.dark ? const Color(0xFF2C2C2E) : Colors.white, shape: BoxShape.circle),
-                    child: Icon(icon, size: 28, color: c.ink),
+                    child: Icon(icon, size: 23, color: color),
                   ),
-                  const SizedBox(height: 8),
-                  Text(label, style: talkText(14, FontWeight.w500, c.ink)),
+                  const SizedBox(height: 6),
+                  Text(label, style: talkText(12.5, FontWeight.w500, c.ink)),
                 ]),
               ),
             );
         return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 20),
-            child: Row(children: [
-              item('library', CupertinoIcons.photo_on_rectangle, 'Fotoğraflar'),
-              item('camera', CupertinoIcons.camera, 'Kamera'),
-              item('files', CupertinoIcons.doc, 'Belge'),
-              item('contact', CupertinoIcons.person_crop_circle, 'Kişi'),
+          child: SizedBox(
+            // altta galeri ızgarası kaydırılabilsin diye sayfa ekranın büyük kısmını kaplar
+            height: MediaQuery.sizeOf(ctx).height * 0.72,
+            child: Column(children: [
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Row(children: [
+                  item('library', CupertinoIcons.photo_fill_on_rectangle_fill, const Color(0xFF2F80ED), 'Fotoğraflar'),
+                  item('camera', CupertinoIcons.camera_fill, c.ink, 'Kamera'),
+                  item('location', CupertinoIcons.location_solid, c.ink, 'Konum'),
+                  item('contact', CupertinoIcons.person_crop_circle_fill, c.muted, 'Kişi'),
+                ]),
+              ),
+              const SizedBox(height: 14),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Row(children: [
+                  item('files', CupertinoIcons.doc_fill, const Color(0xFF2F80ED), 'Belge'),
+                  item('poll', CupertinoIcons.chart_bar_alt_fill, const Color(0xFFF5A623), 'Anket'),
+                  item('event', CupertinoIcons.calendar, const Color(0xFFE11D48), 'Etkinlik'),
+                  const Expanded(child: SizedBox()),
+                ]),
+              ),
+              const SizedBox(height: 16),
+              // galerideki son fotoğraflar (ızgara): dokununca gönderilir
+              Expanded(child: TalkGalleryGrid(onPick: (f) => Navigator.pop(ctx, 'photo:${f.path}'))),
             ]),
           ),
         );
       },
     );
     if (choice == null || !mounted) return;
-    if (choice == 'contact') return _shareContact();
+    switch (choice) {
+      case 'contact':
+        return _shareContact();
+      case 'location':
+        final body = await talkCurrentLocationBody(context);
+        if (body != null && mounted) await _send(body);
+        return;
+      case 'poll':
+        final body = await showTalkPollSheet(context);
+        if (body != null && mounted) await _send(body);
+        return;
+      case 'event':
+        final e = await showTalkEventSheet(context, call: false);
+        if (e != null && mounted) await _send(talkEventBody(e.title, e.at));
+        return;
+    }
+    if (choice.startsWith('photo:')) {
+      final f = File(choice.substring(6));
+      await _sendPicked([TalkMediaItem(path: f.path, name: f.uri.pathSegments.last, size: await f.length())]);
+      return;
+    }
     final picked = await _pickFiles(choice);
     if (picked.isEmpty || !mounted) return;
     await _sendPicked(picked);
+  }
+
+  /// Anket oyu: kullanıcı başına tek tepki (aynı seçenek = oyu geri al, başka seçenek = oyu değiştir)
+  Future<void> _vote(TalkMessage m, String emoji) async {
+    final had = m.reactions.any((r) => r.emoji == emoji && r.mine);
+    final list = [
+      for (final r in m.reactions)
+        if (r.mine) TalkReaction(emoji: r.emoji, count: r.count - 1, mine: false) else r,
+    ];
+    if (!had) {
+      final i = list.indexWhere((r) => r.emoji == emoji);
+      if (i >= 0) {
+        list[i] = TalkReaction(emoji: emoji, count: list[i].count + 1, mine: true);
+      } else {
+        list.add(TalkReaction(emoji: emoji, count: 1, mine: true));
+      }
+    }
+    final before = m.reactions;
+    setState(() => m.reactions = list.where((r) => r.count > 0).toList());
+    try {
+      await _c.api.react(m.id, emoji);
+    } on ArconApiException catch (e) {
+      if (!mounted) return;
+      setState(() => m.reactions = before);
+      talkToast(context, e.message.isEmpty ? 'Oy verilemedi' : e.message, error: true);
+    }
   }
 
   /// Kişi kartı: seçilen kişinin adı ve kullanıcı adı mesaj olarak gider
@@ -753,53 +822,130 @@ class _TalkChatScreenState extends State<TalkChatScreen> {
     );
   }
 
-  /// Mesajı başka sohbetlere ilet (birden fazla seçilebilir)
+  /// Mesajı başka sohbetlere / kişilere ilet (sohbeti olmayan kişiler ve kendine dahil).
   Future<void> _forward(List<TalkMessage> list) async {
     final c = TalkColors.of(context);
-    final picked = <int>{};
-    final targets = await showModalBottomSheet<List<int>>(
+    final picked = <String>{};
+    var q = '';
+    final me = _c.me;
+    final people = [..._c.users]..sort((a, b) => a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()));
+    final groups = _c.channels.where((ch) => ch.isGroup).toList();
+    bool hit(String hay) => q.isEmpty || hay.toLowerCase().contains(q);
+    final targets = await showModalBottomSheet<({List<int> channels, List<int> users})>(
       context: context,
       isScrollControlled: true,
       backgroundColor: c.dark ? const Color(0xFF1F2C34) : Colors.white,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setSheet) => ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(ctx).height * 0.8),
-          child: SafeArea(
-            top: false,
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 16, 12, 8),
-                child: Row(children: [
-                  Expanded(child: Text('İletilecek sohbet', style: talkText(17, FontWeight.w700, c.ink))),
-                  TextButton(
-                    onPressed: picked.isEmpty ? null : () => Navigator.pop(ctx, picked.toList()),
-                    child: Text(picked.isEmpty ? 'Gönder' : 'Gönder (${picked.length})', style: talkText(14.5, FontWeight.w700, picked.isEmpty ? c.muted : TalkColors.wa)),
-                  ),
-                ]),
-              ),
-              Flexible(
-                child: ListView(shrinkWrap: true, children: [
-                  for (final ch in _c.channels)
-                    CheckboxListTile(
-                      value: picked.contains(ch.id),
-                      activeColor: TalkColors.wa,
-                      onChanged: (v) => setSheet(() => v == true ? picked.add(ch.id) : picked.remove(ch.id)),
-                      secondary: TalkAvatar.solid(name: ch.name, photoUrl: _c.api.fileUrl(ch.photo), size: 36, fontSize: 12),
-                      title: Text(ch.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: talkText(15, FontWeight.w600, c.ink)),
+        builder: (ctx, setSheet) {
+          final meHit = me != null && hit('${me.displayName} ${me.username} siz kendime');
+          final shownPeople = people.where((u) => u.id != me?.id && hit('${u.displayName} ${u.username} ${u.department}')).toList();
+          final shownGroups = groups.where((ch) => hit(ch.name)).toList();
+          return ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(ctx).height * 0.85),
+            child: SafeArea(
+              top: false,
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 16, 12, 8),
+                  child: Row(children: [
+                    Expanded(child: Text('İletilecek kişi veya grup', style: talkText(17, FontWeight.w700, c.ink))),
+                    TextButton(
+                      onPressed: picked.isEmpty ? null : () {
+                        Navigator.pop(ctx, (
+                          channels: [
+                            for (final k in picked)
+                              if (k.startsWith('c:')) int.tryParse(k.substring(2)) ?? 0
+                          ].where((id) => id > 0).toList(),
+                          users: [
+                            for (final k in picked)
+                              if (k.startsWith('u:')) int.tryParse(k.substring(2)) ?? 0
+                          ].where((id) => id > 0).toList(),
+                        ));
+                      },
+                      child: Text(picked.isEmpty ? 'Gönder' : 'Gönder (${picked.length})', style: talkText(14.5, FontWeight.w700, picked.isEmpty ? c.muted : TalkColors.wa)),
                     ),
-                ]),
-              ),
-            ]),
-          ),
-        ),
+                  ]),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: TextField(
+                    onChanged: (v) => setSheet(() => q = v.trim()),
+                    style: talkText(16, FontWeight.w400, c.ink),
+                    cursorColor: c.ink,
+                    decoration: InputDecoration(
+                      isDense: true,
+                      filled: true,
+                      fillColor: c.searchBg,
+                      hintText: 'Kişi veya grup ara',
+                      hintStyle: talkText(16, FontWeight.w400, c.muted),
+                      prefixIcon: Icon(Icons.search, size: 20, color: c.muted),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                    ),
+                  ),
+                ),
+                Flexible(
+                  child: ListView(shrinkWrap: true, children: [
+                    if (meHit && me != null)
+                      CheckboxListTile(
+                        value: picked.contains('u:${me.id}'),
+                        activeColor: TalkColors.wa,
+                        onChanged: (v) => setSheet(() => v == true ? picked.add('u:${me.id}') : picked.remove('u:${me.id}')),
+                        secondary: TalkAvatar.solid(name: me.displayName, photoUrl: _c.api.fileUrl(me.avatarPath), size: 36, fontSize: 12, personIfEmpty: true),
+                        title: Text('${me.displayName} (Siz)', maxLines: 1, overflow: TextOverflow.ellipsis, style: talkText(15, FontWeight.w600, c.ink)),
+                        subtitle: Text('Kendinize mesaj gönderin', style: talkText(13, FontWeight.w400, c.muted)),
+                      ),
+                    if (shownPeople.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 10, 20, 4),
+                        child: Text('Kişiler', style: talkText(13, FontWeight.w700, c.muted)),
+                      ),
+                    for (final u in shownPeople)
+                      CheckboxListTile(
+                        value: picked.contains('u:${u.id}'),
+                        activeColor: TalkColors.wa,
+                        onChanged: (v) => setSheet(() => v == true ? picked.add('u:${u.id}') : picked.remove('u:${u.id}')),
+                        secondary: TalkAvatar.solid(name: u.displayName, photoUrl: _c.api.fileUrl(u.avatarPath), size: 36, fontSize: 12, personIfEmpty: true),
+                        title: Text(u.displayName, maxLines: 1, overflow: TextOverflow.ellipsis, style: talkText(15, FontWeight.w600, c.ink)),
+                        subtitle: Text(
+                          u.department.trim().isNotEmpty ? u.department : '@${u.username}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: talkText(13, FontWeight.w400, c.muted),
+                        ),
+                      ),
+                    if (shownGroups.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 10, 20, 4),
+                        child: Text('Gruplar', style: talkText(13, FontWeight.w700, c.muted)),
+                      ),
+                    for (final ch in shownGroups)
+                      CheckboxListTile(
+                        value: picked.contains('c:${ch.id}'),
+                        activeColor: TalkColors.wa,
+                        onChanged: (v) => setSheet(() => v == true ? picked.add('c:${ch.id}') : picked.remove('c:${ch.id}')),
+                        secondary: TalkAvatar.solid(name: ch.name, photoUrl: _c.api.fileUrl(ch.photo), size: 36, fontSize: 12),
+                        title: Text(ch.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: talkText(15, FontWeight.w600, c.ink)),
+                        subtitle: Text('${ch.memberCount} üye', style: talkText(13, FontWeight.w400, c.muted)),
+                      ),
+                    if (!meHit && shownPeople.isEmpty && shownGroups.isEmpty)
+                      Padding(
+                        padding: const EdgeInsets.all(28),
+                        child: Text(q.isEmpty ? 'Kişi yok' : 'Sonuç yok', textAlign: TextAlign.center, style: talkText(15, FontWeight.w400, c.muted)),
+                      ),
+                  ]),
+                ),
+              ]),
+            ),
+          );
+        },
       ),
     );
-    if (targets == null || targets.isEmpty || !mounted) return;
+    if (targets == null || (targets.channels.isEmpty && targets.users.isEmpty) || !mounted) return;
     try {
       var n = 0;
       for (final m in list) {
-        n = await _c.api.forward(m.id, targets);
+        n = await _c.api.forward(m.id, channelIds: targets.channels, userIds: targets.users);
       }
       if (mounted) {
         talkToast(context, list.length > 1 ? '${list.length} mesaj iletildi' : (n == 1 ? 'Mesaj iletildi' : '$n sohbete iletildi'));
@@ -1024,6 +1170,11 @@ class _TalkChatScreenState extends State<TalkChatScreen> {
     if (res != null && res.startsWith('jump:')) _jumpTo(int.tryParse(res.substring(5)) ?? 0);
     // bilgi ekranındaki "Sohbette ara"
     if (res == 'search') setState(() => _searching = true);
+    // "Sohbeti temizle": eski mesajlar sunucudan artık gelmez, listeyi baştan yükle
+    if (res == 'cleared') {
+      await _load();
+      if (mounted) setState(() {});
+    }
     _refreshSidebar();
   }
 
@@ -1039,6 +1190,10 @@ class _TalkChatScreenState extends State<TalkChatScreen> {
 
   Future<void> _openContact(TalkUser user) async {
     if (user.id == _c.me?.id) return;
+    // grupta: üyenin rolü ve benim yönetme yetkim (sahibe işlem yok)
+    final side = _side;
+    final role = side?.people.where((p) => p.id == user.id).firstOrNull?.role ?? '';
+    final manage = _ch.isGroup && (side?.canManage ?? false) && role.isNotEmpty && role != 'owner';
     await showTalkContactSheet(
       context: context,
       user: user,
@@ -1046,7 +1201,53 @@ class _TalkChatScreenState extends State<TalkChatScreen> {
       onMessage: () => unawaited(_contactMessage(user)),
       onVoice: () => unawaited(_contactCall(user, video: false)),
       onVideo: () => unawaited(_contactCall(user, video: true)),
+      onInfo: _ch.isGroup ? () => unawaited(_contactInfo(user)) : null,
+      admin: manage
+          ? (
+              isAdmin: role == 'admin',
+              onToggleAdmin: () => unawaited(_memberRole(user, admin: role != 'admin')),
+              onRemove: () => unawaited(_memberRemove(user)),
+            )
+          : null,
     );
+  }
+
+  /// Üyenin kişi bilgisi (birebir sohbetin bilgi ekranı)
+  Future<void> _contactInfo(TalkUser user) async {
+    try {
+      final ch = await _c.api.openDm(user.id);
+      if (ch == null || !mounted) return;
+      _c.upsertChannel(ch);
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => TalkInfoScreen(controller: _c, channel: ch, session: widget.session, config: widget.config),
+      ));
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'Bilgi açılamadı' : e.message, error: true);
+    }
+  }
+
+  Future<void> _memberRole(TalkUser user, {required bool admin}) async {
+    try {
+      final ns = await _c.api.setRole(_ch.id, user.id, admin ? 'admin' : 'member');
+      if (!mounted) return;
+      setState(() => _side = ns);
+      talkToast(context, admin ? '${talkFirstName(user.displayName)} artık grup yöneticisi' : '${talkFirstName(user.displayName)} yöneticilikten çıkarıldı');
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'İşlem başarısız' : e.message, error: true);
+    }
+  }
+
+  Future<void> _memberRemove(TalkUser user) async {
+    final ok = await talkConfirm(context, title: 'Gruptan çıkar', message: '${user.displayName} gruptan çıkarılsın mı?', ok: 'Çıkar');
+    if (!ok || !mounted) return;
+    try {
+      final ns = await _c.api.removeMember(_ch.id, user.id);
+      if (!mounted) return;
+      setState(() => _side = ns);
+      talkToast(context, '${talkFirstName(user.displayName)} gruptan çıkarıldı');
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'Çıkarılamadı' : e.message, error: true);
+    }
   }
 
   Future<void> _contactMessage(TalkUser user) async {
@@ -1326,10 +1527,20 @@ class _TalkChatScreenState extends State<TalkChatScreen> {
         final key = _keys.putIfAbsent(m.id, GlobalKey.new);
         final picked = _selected.contains(m.id);
         final callLine = m.attachments.isEmpty ? talkCallLine(m.body) : null;
+        final event = m.attachments.isEmpty && callLine == null ? talkEventLine(m.body) : null;
+        final place = m.attachments.isEmpty && callLine == null && event == null ? talkLocationLine(m.body) : null;
+        final poll = m.attachments.isEmpty && callLine == null && event == null && place == null ? talkPollLine(m.body) : null;
         final view = callLine != null
             // WhatsApp gibi arama balonu; dokununca geri arar
             ? TalkCallLineView(line: callLine, mine: m.userId == _meId, time: talkClock(m.createdAt), onTap: () => _startCall(video: callLine.video))
-            : TalkMessageView(
+            : event != null
+                // etkinlik / planlı arama kartı
+                ? TalkEventCardView(event: event, mine: m.userId == _meId, time: talkClock(m.createdAt), onCall: (v) => _startCall(video: v))
+                : place != null
+                    ? TalkLocationCardView(location: place, mine: m.userId == _meId, time: talkClock(m.createdAt))
+                    : poll != null && m.id > 0
+                        ? TalkPollCardView(poll: poll, reactions: m.reactions, mine: m.userId == _meId, time: talkClock(m.createdAt), onVote: (e) => _vote(m, e))
+                        : TalkMessageView(
           message: m,
           mine: m.userId == _meId,
           group: _ch.isGroup,

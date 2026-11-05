@@ -50,6 +50,17 @@ class TalkController extends ChangeNotifier {
   String get _draftKey => 'arcon_talk_drafts_${me?.id ?? 0}';
   String get _mutedKey => 'arcon_talk_muted_${me?.id ?? 0}';
   String get _archKey => 'arcon_talk_archived_${me?.id ?? 0}';
+  String get _lockKey => 'arcon_talk_locked_${me?.id ?? 0}';
+  String get _listsKey => 'arcon_talk_lists_${me?.id ?? 0}';
+
+  /// WhatsApp "Sohbeti kilitle": listede görünmez, "Kilitli sohbetler"den Face ID ile açılır (yalnızca bu telefonda)
+  Set<int> locked = {};
+
+  /// WhatsApp "Listeye ekle": ad → sohbet id'leri; sohbet listesinde çip olarak görünür (yalnızca bu telefonda)
+  Map<String, Set<int>> lists = {};
+
+  /// Seçili liste çipi (doluysa [filter] yerine bu listeye göre süzülür)
+  String? listFilter;
 
   Future<void> start() async {
     await refresh();
@@ -108,6 +119,15 @@ class TalkController extends ChangeNotifier {
         favourites = (p.getStringList(_favKey) ?? const []).map(int.parse).toSet();
         muted = (p.getStringList(_mutedKey) ?? const []).map(int.parse).toSet();
         archived = (p.getStringList(_archKey) ?? const []).map(int.parse).toSet();
+        locked = (p.getStringList(_lockKey) ?? const []).map(int.parse).toSet();
+        try {
+          final raw = jsonDecode(p.getString(_listsKey) ?? '{}') as Map<String, dynamic>;
+          lists = {
+            for (final e in raw.entries) e.key: {for (final v in (e.value as List)) (v as num).toInt()},
+          };
+        } catch (_) {
+          lists = {};
+        }
         LocalNotifier.muted = {...muted};
         try {
           final raw = jsonDecode(p.getString(_draftKey) ?? '{}') as Map<String, dynamic>;
@@ -130,17 +150,24 @@ class TalkController extends ChangeNotifier {
   List<TalkChannel> get visible {
     final q = query.trim().toLowerCase();
     return channels.where((c) {
+      // kilitli sohbetler hiçbir zaman ana listede (aramada da) görünmez
+      if (locked.contains(c.id)) return false;
       // arşivdekiler yalnızca aramada görünür
       if (archived.contains(c.id) && q.isEmpty) return false;
-      switch (filter) {
-        case TalkFilter.unread:
-          if (c.unread <= 0) return false;
-        case TalkFilter.favourites:
-          if (!favourites.contains(c.id)) return false;
-        case TalkFilter.groups:
-          if (c.isDm) return false;
-        case TalkFilter.all:
-          break;
+      final list = listFilter;
+      if (list != null) {
+        if (!(lists[list]?.contains(c.id) ?? false)) return false;
+      } else {
+        switch (filter) {
+          case TalkFilter.unread:
+            if (c.unread <= 0) return false;
+          case TalkFilter.favourites:
+            if (!favourites.contains(c.id)) return false;
+          case TalkFilter.groups:
+            if (c.isDm) return false;
+          case TalkFilter.all:
+            break;
+        }
       }
       if (q.isEmpty) return true;
       return c.name.toLowerCase().contains(q);
@@ -149,7 +176,47 @@ class TalkController extends ChangeNotifier {
 
   void setFilter(TalkFilter f) {
     filter = f;
+    listFilter = null;
     notifyListeners();
+  }
+
+  void setListFilter(String? name) {
+    listFilter = name;
+    filter = TalkFilter.all;
+    notifyListeners();
+  }
+
+  List<TalkChannel> get lockedChannels => channels.where((c) => locked.contains(c.id)).toList();
+
+  Future<void> toggleLock(int id) async {
+    locked.contains(id) ? locked.remove(id) : locked.add(id);
+    notifyListeners();
+    final p = await SharedPreferences.getInstance();
+    await p.setStringList(_lockKey, locked.map((e) => '$e').toList());
+  }
+
+  Future<void> _saveLists() async {
+    notifyListeners();
+    final p = await SharedPreferences.getInstance();
+    await p.setString(_listsKey, jsonEncode({for (final e in lists.entries) e.key: e.value.toList()}));
+  }
+
+  /// Sohbeti listeye ekle / listeden çıkar; liste yoksa oluşturulur
+  Future<void> toggleInList(String name, int channelId) async {
+    final set = lists.putIfAbsent(name, () => <int>{});
+    set.contains(channelId) ? set.remove(channelId) : set.add(channelId);
+    await _saveLists();
+  }
+
+  Future<void> createList(String name) async {
+    lists.putIfAbsent(name, () => <int>{});
+    await _saveLists();
+  }
+
+  Future<void> deleteList(String name) async {
+    lists.remove(name);
+    if (listFilter == name) listFilter = null;
+    await _saveLists();
   }
 
   void setQuery(String q) {

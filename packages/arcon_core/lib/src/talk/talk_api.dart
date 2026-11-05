@@ -94,8 +94,12 @@ class TalkApi {
     );
   }
 
-  Future<int> forward(int messageId, List<int> channelIds) async =>
-      ((await _post('forward', {'message_id': messageId, 'channel_ids': channelIds}))['sent'] as num?)?.toInt() ?? 0;
+  Future<int> forward(int messageId, {List<int> channelIds = const [], List<int> userIds = const []}) async =>
+      ((await _post('forward', {
+        'message_id': messageId,
+        'channel_ids': channelIds,
+        'user_ids': userIds,
+      }))['sent'] as num?)?.toInt() ?? 0;
 
   Future<TalkSidebar> sidebar(int channelId) async => TalkSidebar.fromJson(await _get('sidebar', {'channel_id': '$channelId'}));
 
@@ -151,6 +155,12 @@ class TalkApi {
       TalkSidebar.fromJson(await _post('set_disappear', {'channel_id': channelId, 'disappear_after_sec': sec}));
   Future<TalkSidebar> invite(int channelId, List<int> userIds, String role) async =>
       TalkSidebar.fromJson(await _post('invite', {'channel_id': channelId, 'user_ids': userIds, 'role': role}));
+  /// Sohbeti temizle: önceki mesajlar yalnızca bu kullanıcıdan gizlenir
+  Future<void> clearChat(int channelId) async => _post('clear_chat', {'channel_id': channelId});
+
+  /// Kısıtlı sohbet (yalnızca grup yöneticisi): mesajlar iletilemez / dışa aktarılamaz
+  Future<TalkSidebar> setRestricted(int channelId, bool on) async =>
+      TalkSidebar.fromJson(await _post('set_restricted', {'channel_id': channelId, 'restricted': on}));
   Future<String> inviteLink(int channelId) async => '${(await _post('invite_link', {'channel_id': channelId}))['url'] ?? ''}';
   Future<TalkSidebar> removeMember(int channelId, int userId) async =>
       TalkSidebar.fromJson(await _post('remove_member', {'channel_id': channelId, 'user_id': userId}));

@@ -1,6 +1,7 @@
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../api/api_client.dart';
 import '../auth/session_controller.dart';
@@ -10,16 +11,18 @@ import 'talk_chat_screen.dart';
 import 'talk_contact_sheet.dart';
 import 'talk_controller.dart';
 import 'talk_icons.dart';
-import 'talk_message.dart';
+import 'talk_media_screen.dart';
 import 'talk_models.dart';
 import 'talk_pickers.dart';
+import 'talk_privacy.dart';
 import 'talk_theme.dart';
 import 'talk_widgets.dart';
 
 const _fileSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
 const _mailSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M4 7l8 6 8-6"/></svg>';
 
-/// `.talk-info` — Grup bilgisi / Kişi bilgisi (telefonda tam ekran).
+/// WhatsApp iOS grup / kişi bilgisi: büyük fotoğraf, ad, hızlı düğmeler ve Üyeler / Medya / Ayarlar sekmeleri.
+/// Sohbet ekranına dönüş değerleri: 'search' (sohbette ara), 'jump:<mesaj id>', 'left' (gruptan çıkıldı), 'cleared' (sohbet temizlendi).
 class TalkInfoScreen extends StatefulWidget {
   const TalkInfoScreen({super.key, required this.controller, required this.channel, required this.session, required this.config, this.sidebar});
 
@@ -36,23 +39,32 @@ class TalkInfoScreen extends StatefulWidget {
 class _TalkInfoScreenState extends State<TalkInfoScreen> {
   TalkController get _c => widget.controller;
   late TalkSidebar? _s = widget.sidebar;
-  final _name = TextEditingController();
-  final _desc = TextEditingController();
-  bool _mediaOpen = false;
-  String _tab = 'media';
+  final _scroll = ScrollController();
+  final _taskInput = TextEditingController();
+  final _memberQuery = TextEditingController();
+  String _tab = '';
+  bool _descOpen = false;
+  bool _searchMembers = false;
+  bool _titleInBar = false;
   String _myAvatar = '';
-
-  @override
-  void dispose() {
-    _taskInput.dispose();
-    super.dispose();
-  }
 
   @override
   void initState() {
     super.initState();
     _apply(_s);
+    _scroll.addListener(() {
+      final show = _scroll.offset > 230;
+      if (show != _titleInBar) setState(() => _titleInBar = show);
+    });
     _load();
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    _taskInput.dispose();
+    _memberQuery.dispose();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -66,21 +78,57 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
 
   void _apply(TalkSidebar? s) {
     _s = s;
-    if (s == null) return;
-    _name.text = s.name;
-    _desc.text = s.isDm ? 'Direkt mesaj' : s.description;
     _myAvatar = _c.me?.avatarPath ?? '';
   }
 
   bool get _isDm => _s?.isDm ?? widget.channel.isDm;
   bool get _canManage => (_s?.canManage ?? false) && !_isDm;
   bool get _canInvite => (_s?.canInvite ?? false) && !_isDm;
+  int get _meId => _c.me?.id ?? 0;
+  String get _currentTab => _tab.isNotEmpty ? _tab : (_isDm ? 'media' : 'members');
 
-  Future<void> _saveChannel() async {
+  TalkUser? get _peer {
+    final p = _s?.channel['peer'];
+    return p is Map ? TalkUser.fromJson(p.cast<String, dynamic>()) : widget.channel.peer;
+  }
+
+  String get _photo {
+    final s = _s;
+    final own = s?.avatarPath ?? widget.channel.avatarPath;
+    return own.isNotEmpty ? own : (_peer?.avatarPath ?? '');
+  }
+
+  String get _title => (_s?.name ?? '').isNotEmpty ? _s!.name : widget.channel.name;
+
+  // ---------- işlemler ----------
+
+  /// Grup adı ve açıklaması (yalnızca yönetebilen)
+  Future<void> _editGroup() async {
+    final s = _s;
+    if (s == null || !_canManage) return;
+    final name = TextEditingController(text: s.name);
+    final desc = TextEditingController(text: s.description);
+    final ok = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('Grubu düzenle'),
+        content: Column(children: [
+          const SizedBox(height: 10),
+          CupertinoTextField(controller: name, placeholder: 'Grup adı', maxLength: 120),
+          const SizedBox(height: 8),
+          CupertinoTextField(controller: desc, placeholder: 'Grup açıklaması', maxLines: 4, minLines: 2, maxLength: 255),
+        ]),
+        actions: [
+          CupertinoDialogAction(onPressed: () => Navigator.pop(ctx, false), child: const Text('Vazgeç')),
+          CupertinoDialogAction(isDefaultAction: true, onPressed: () => Navigator.pop(ctx, true), child: const Text('Kaydet')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
     try {
-      final s = await _c.api.updateChannel(widget.channel.id, name: _name.text.trim(), description: _desc.text.trim());
-      setState(() => _apply(s));
-      widget.channel.name = s.name;
+      final ns = await _c.api.updateChannel(widget.channel.id, name: name.text.trim(), description: desc.text.trim());
+      setState(() => _apply(ns));
+      widget.channel.name = ns.name;
       if (mounted) talkToast(context, 'Kaydedildi');
     } on ArconApiException catch (e) {
       if (mounted) talkToast(context, e.message.isEmpty ? 'Kaydedilemedi' : e.message, error: true);
@@ -116,8 +164,8 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
     if (s == null) return;
     if (!s.canSetDisappear) {
       talkToast(context, s.disappearSec > 0
-          ? 'Süreli mesaj açık: ${s.disappearLabel}. Değiştirmek için grup admini olmalısın.'
-          : 'Süreli mesajı yalnızca grup admini (DM’de her iki taraf) ayarlayabilir.');
+          ? 'Süreli mesaj açık: ${s.disappearLabel}. Değiştirmek için grup yöneticisi olmalısın.'
+          : 'Süreli mesajı yalnızca grup yöneticisi (birebir sohbette iki taraf) ayarlayabilir.');
       return;
     }
     final sec = await showDisappearModal(context, s.disappearSec);
@@ -140,7 +188,342 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
     if (ns != null) setState(() => _apply(ns));
   }
 
+  /// Grupta / birebirde arama (grupta önce sesli mi görüntülü mü sorulur)
+  Future<void> _call({bool? video}) async {
+    var v = video;
+    if (v == null) {
+      final pick = await showCupertinoModalPopup<bool>(
+        context: context,
+        builder: (ctx) => CupertinoActionSheet(
+          actions: [
+            CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, false), child: const Text('Sesli arama')),
+            CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, true), child: const Text('Görüntülü arama')),
+          ],
+          cancelButton: CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx), child: const Text('Vazgeç')),
+        ),
+      );
+      if (pick == null) return;
+      v = pick;
+    }
+    if (!mounted) return;
+    await TalkCallScreen.start(
+      context,
+      api: _c.api,
+      channelId: widget.channel.id,
+      video: v,
+      title: _title,
+      peerName: _isDm ? (_peer?.displayName ?? _title) : _title,
+      photoUrl: _c.api.fileUrl(_photo),
+    );
+  }
+
+  /// Paylaş: grupta davet bağlantısı (yetkiliyse), değilse grup / kişi adı
+  Future<void> _share() async {
+    final box = context.findRenderObject() as RenderBox?;
+    var text = _isDm ? "${_peer?.displayName ?? _title} · ARCONNECT'te @${_peer?.username ?? ''}" : "ARCONNECT grubu: $_title";
+    if (_canInvite) {
+      try {
+        final url = await _c.api.inviteLink(widget.channel.id);
+        if (url.isNotEmpty) text = "ARCONNECT'te \"$_title\" grubuna katıl: $url";
+      } on ArconApiException {
+        // bağlantı alınamazsa grup adı paylaşılır
+      }
+    }
+    await SharePlus.instance.share(ShareParams(
+      text: text,
+      sharePositionOrigin: box == null ? null : box.localToGlobal(Offset.zero) & box.size,
+    ));
+  }
+
+  /// Sohbeti dışa aktar: son mesajlar düz metin olarak paylaşılır
+  Future<void> _export() async {
+    final box = context.findRenderObject() as RenderBox?;
+    try {
+      final r = await _c.api.messages(widget.channel.id);
+      String two(int n) => n.toString().padLeft(2, '0');
+      final lines = [
+        for (final m in r.messages)
+          if (m.body.trim().isNotEmpty || m.attachments.isNotEmpty)
+            () {
+              final d = talkParseTime(m.createdAt);
+              final at = d == null ? '' : '${two(d.day)}.${two(d.month)}.${d.year} ${two(d.hour)}:${two(d.minute)}';
+              final files = m.attachments.map((a) => '<${a.origName}>').join(' ');
+              return '[$at] ${m.displayName.isEmpty ? m.username : m.displayName}: ${m.body.trim()} $files'.trim();
+            }(),
+      ];
+      if (lines.isEmpty) {
+        if (mounted) talkToast(context, 'Dışa aktarılacak mesaj yok');
+        return;
+      }
+      await SharePlus.instance.share(ShareParams(
+        text: 'ARCONNECT · $_title\n\n${lines.join('\n')}',
+        subject: '$_title sohbeti',
+        sharePositionOrigin: box == null ? null : box.localToGlobal(Offset.zero) & box.size,
+      ));
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'Dışa aktarılamadı' : e.message, error: true);
+    }
+  }
+
+  /// Benzer bir grup: aynı üyelerle yeni grup
+  Future<void> _similarGroup() async {
+    final s = _s;
+    if (s == null) return;
+    final name = TextEditingController(text: '${s.name} 2');
+    final ok = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('Benzer bir grup oluşturun'),
+        content: Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Column(children: [
+            Text('${s.people.length} üyeyle yeni grup', style: const TextStyle(fontSize: 13)),
+            const SizedBox(height: 8),
+            CupertinoTextField(controller: name, placeholder: 'Grup adı', maxLength: 120),
+          ]),
+        ),
+        actions: [
+          CupertinoDialogAction(onPressed: () => Navigator.pop(ctx, false), child: const Text('Vazgeç')),
+          CupertinoDialogAction(isDefaultAction: true, onPressed: () => Navigator.pop(ctx, true), child: const Text('Oluştur')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted || name.text.trim().length < 2) return;
+    try {
+      final id = await _c.api.createChannel(
+        type: 'group',
+        name: name.text.trim(),
+        memberIds: [for (final p in s.people) if (p.id != _meId) p.id],
+      );
+      await _c.refresh();
+      final ch = _c.channels.where((x) => x.id == id).firstOrNull;
+      if (ch == null || !mounted) return;
+      await Navigator.of(context).pushReplacement(MaterialPageRoute(
+        builder: (_) => TalkChatScreen(controller: _c, channel: ch, config: widget.config, session: widget.session),
+      ));
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'Grup oluşturulamadı' : e.message, error: true);
+    }
+  }
+
+  /// Sohbeti kilitle: yalnızca bu telefonda; her iki yönde de Face ID / parmak izi ister
+  Future<void> _toggleLock() async {
+    final id = widget.channel.id;
+    final on = _c.locked.contains(id);
+    if (!await talkUnlock(context, reason: on ? 'Sohbetin kilidini açmak için doğrula' : 'Sohbeti kilitlemek için doğrula') || !mounted) return;
+    await _c.toggleLock(id);
+    if (mounted) talkToast(context, on ? 'Sohbetin kilidi açıldı' : 'Sohbet kilitlendi · Sohbetler › Kilitli sohbetler');
+  }
+
+  /// Kısıtlı sohbet: açıklama + (yöneticiyse) aç/kapat
+  Future<void> _restrictedSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setSheet) {
+        final c = TalkColors.of(ctx);
+        final on = _s?.restricted ?? false;
+        return Container(
+          decoration: BoxDecoration(color: _bg(c), borderRadius: const BorderRadius.vertical(top: Radius.circular(22))),
+          child: SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+              child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Icon(CupertinoIcons.shield_lefthalf_fill, size: 40, color: c.ink),
+                const SizedBox(height: 10),
+                Text('Kısıtlı sohbet', textAlign: TextAlign.center, style: talkText(20, FontWeight.w700, c.ink)),
+                const SizedBox(height: 8),
+                Text(
+                  'Açıkken bu sohbetteki mesajlar başka sohbetlere iletilemez ve sohbet dışa aktarılamaz. Ayar sohbetteki herkes için geçerlidir.',
+                  textAlign: TextAlign.center,
+                  style: talkText(15, FontWeight.w400, c.muted, height: 1.4),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  decoration: BoxDecoration(color: _cardBg(c), borderRadius: BorderRadius.circular(16)),
+                  child: _row(
+                    c,
+                    title: 'Kısıtlı sohbet',
+                    subtitle: _canManage ? null : 'Yalnızca grup yöneticileri değiştirebilir',
+                    trailing: CupertinoSwitch(
+                      value: on,
+                      activeTrackColor: c.ink,
+                      onChanged: !_canManage
+                          ? null
+                          : (v) async {
+                              try {
+                                final ns = await _c.api.setRestricted(widget.channel.id, v);
+                                if (!mounted) return;
+                                setState(() => _apply(ns));
+                                setSheet(() {});
+                              } on ArconApiException catch (e) {
+                                if (mounted) talkToast(context, e.message.isEmpty ? 'Ayarlanamadı' : e.message, error: true);
+                              }
+                            },
+                    ),
+                  ),
+                ),
+              ]),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  /// Şifreleme: gerçekte ne olduğunu anlatır (uçtan uca değil)
+  Future<void> _encryptionSheet() => showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: Colors.transparent,
+        builder: (ctx) {
+          final c = TalkColors.of(ctx);
+          return Container(
+            decoration: BoxDecoration(color: _bg(c), borderRadius: const BorderRadius.vertical(top: Radius.circular(22))),
+            child: SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(24, 22, 24, 20),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(CupertinoIcons.lock_fill, size: 40, color: c.ink),
+                  const SizedBox(height: 10),
+                  Text('Şifreleme', style: talkText(20, FontWeight.w700, c.ink)),
+                  const SizedBox(height: 10),
+                  Text(
+                    'Mesajlar, dosyalar ve aramalar telefonun ile ARCON sunucuları arasında şifreli bağlantı (HTTPS) üzerinden iletilir. '
+                    'Mesajlar şirketin ARCON sunucusunda saklanır; uçtan uca şifreli değildir.',
+                    textAlign: TextAlign.center,
+                    style: talkText(15, FontWeight.w400, c.muted, height: 1.45),
+                  ),
+                ]),
+              ),
+            ),
+          );
+        },
+      );
+
+  /// Sohbeti temizle: eski mesajlar yalnızca senden gizlenir
+  Future<void> _clearChat() async {
+    final ok = await talkConfirm(context,
+        title: 'Sohbet temizlensin mi?', message: 'Bu sohbetteki mesajlar yalnızca senin için silinir. Diğer üyelerde kalır.', ok: 'Temizle');
+    if (!ok || !mounted) return;
+    try {
+      await _c.api.clearChat(widget.channel.id);
+      if (!mounted) return;
+      talkToast(context, 'Sohbet temizlendi');
+      Navigator.of(context).pop('cleared');
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'Temizlenemedi' : e.message, error: true);
+    }
+  }
+
+  /// Şikayet et: sebep seçilir, ARCON platform yöneticisine (Anılcan) birebir mesajla bildirilir
+  Future<void> _report() async {
+    const adminId = 2;
+    if (_meId == adminId) {
+      talkToast(context, 'Şikayetler zaten sana geliyor');
+      return;
+    }
+    final kind = _isDm ? 'Kişiyi' : 'Grubu';
+    final reason = await showCupertinoModalPopup<String>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        title: Text('$kind şikayet et'),
+        message: const Text('Şikayet ARCON yöneticisine iletilir. Kimse sohbetten çıkarılmaz.'),
+        actions: [
+          for (final r in const ['Uygunsuz içerik', 'Taciz veya hakaret', 'Spam', 'Gizli bilgi paylaşımı', 'Diğer'])
+            CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, r), child: Text(r)),
+        ],
+        cancelButton: CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx), child: const Text('Vazgeç')),
+      ),
+    );
+    if (reason == null || !mounted) return;
+    try {
+      final dm = await _c.api.openDm(adminId);
+      if (dm == null) throw const ArconApiException('report', '');
+      _c.upsertChannel(dm);
+      await _c.api.sendMessage(
+        channelId: dm.id,
+        body: '⚠️ Şikayet · ${_isDm ? 'Kişi' : 'Grup'}: $_title (#${widget.channel.id})\nSebep: $reason',
+      );
+      if (mounted) talkToast(context, 'Şikayetin iletildi');
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'Şikayet gönderilemedi' : e.message, error: true);
+    }
+  }
+
+  /// Sohbeti sil: listeden kaldırır (yeni mesaj gelince geri gelir)
+  Future<void> _deleteChat() async {
+    final ok = await talkConfirm(context,
+        title: 'Bu sohbet silinsin mi?', message: 'Sohbet listenden kaldırılır. Yeni mesaj gelirse yeniden görünür.', ok: 'Sil');
+    if (!ok || !mounted) return;
+    try {
+      await _c.hideChat(widget.channel);
+      if (mounted) Navigator.of(context).pop('left');
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'Silinemedi' : e.message, error: true);
+    }
+  }
+
+  Future<void> _leave() async {
+    final ok = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: Text('"${widget.channel.name}" grubundan çıkılsın mı?'),
+        content: const Text('Bu gruptan artık mesaj almayacaksın.'),
+        actions: [
+          CupertinoDialogAction(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
+          CupertinoDialogAction(isDestructiveAction: true, onPressed: () => Navigator.pop(ctx, true), child: const Text('Çık')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      await _c.leaveChannel(widget.channel);
+      if (!mounted) return;
+      talkToast(context, 'Gruptan çıktın');
+      Navigator.of(context).pop('left');
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'Gruptan çıkılamadı' : e.message, error: true);
+    }
+  }
+
+  /// "…": sohbette ara, sessize al, arşivle, grubu düzenle, profil fotoğrafım
+  Future<void> _more() async {
+    final id = widget.channel.id;
+    final v = await showCupertinoModalPopup<String>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        actions: [
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'search'), child: const Text('Sohbette ara')),
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'mute'), child: Text(_c.muted.contains(id) ? 'Bildirimleri aç' : 'Sessize al')),
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'archive'), child: Text(_c.archived.contains(id) ? 'Arşivden çıkar' : 'Sohbeti arşivle')),
+          if (_canManage) CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'edit'), child: const Text('Grubu düzenle')),
+          CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx, 'photo'), child: const Text('Profil fotoğrafımı değiştir')),
+        ],
+        cancelButton: CupertinoActionSheetAction(onPressed: () => Navigator.pop(ctx), child: const Text('Vazgeç')),
+      ),
+    );
+    if (!mounted || v == null) return;
+    switch (v) {
+      case 'search':
+        Navigator.pop(context, 'search');
+      case 'mute':
+        await _c.toggleMute(id);
+      case 'archive':
+        await _c.toggleArchive(id);
+      case 'edit':
+        await _editGroup();
+      case 'photo':
+        await _pickMyAvatar();
+    }
+    if (mounted) setState(() {});
+  }
+
+  // ---------- üyeler ----------
+
   Future<void> _openMember(TalkUser p) async {
+    final manage = _canManage && p.id != _meId && p.role != 'owner';
     await showTalkContactSheet(
       context: context,
       user: p,
@@ -148,7 +531,29 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
       onMessage: () => _memberOp('dm', p),
       onVoice: () => _callMember(p, video: false),
       onVideo: () => _callMember(p, video: true),
+      onInfo: () => _memberInfo(p),
+      admin: manage
+          ? (
+              isAdmin: p.role == 'admin',
+              onToggleAdmin: () => _memberOp(p.role == 'admin' ? 'demote' : 'promote', p),
+              onRemove: () => _memberOp('remove', p),
+            )
+          : null,
     );
+  }
+
+  /// Üyenin kişi bilgisi (birebir sohbetin bilgi ekranı)
+  Future<void> _memberInfo(TalkUser u) async {
+    try {
+      final ch = await _c.api.openDm(u.id);
+      if (ch == null || !mounted) return;
+      _c.upsertChannel(ch);
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => TalkInfoScreen(controller: _c, channel: ch, session: widget.session, config: widget.config),
+      ));
+    } on ArconApiException catch (e) {
+      if (mounted) talkToast(context, e.message.isEmpty ? 'Bilgi açılamadı' : e.message, error: true);
+    }
   }
 
   Future<void> _callMember(TalkUser u, {required bool video}) async {
@@ -184,15 +589,15 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
       }
       TalkSidebar ns;
       if (act == 'remove') {
-        if (!await talkConfirm(context, title: 'Üyeyi çıkar', message: 'Üyeyi kanaldan çıkarmak istiyor musun?')) return;
+        if (!await talkConfirm(context, title: 'Gruptan çıkar', message: '${u.displayName} gruptan çıkarılsın mı?', ok: 'Çıkar')) return;
         ns = await _c.api.removeMember(widget.channel.id, u.id);
-        if (mounted) talkToast(context, 'Üye kanaldan çıkarıldı');
+        if (mounted) talkToast(context, '${talkFirstName(u.displayName)} gruptan çıkarıldı');
       } else if (act == 'promote') {
         ns = await _c.api.setRole(widget.channel.id, u.id, 'admin');
-        if (mounted) talkToast(context, 'Admin yapıldı');
+        if (mounted) talkToast(context, '${talkFirstName(u.displayName)} artık grup yöneticisi');
       } else {
         ns = await _c.api.setRole(widget.channel.id, u.id, 'member');
-        if (mounted) talkToast(context, 'Üye rolüne alındı');
+        if (mounted) talkToast(context, '${talkFirstName(u.displayName)} yöneticilikten çıkarıldı');
       }
       setState(() => _apply(ns));
     } on ArconApiException catch (e) {
@@ -200,499 +605,466 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
     }
   }
 
+  // ---------- görünüm ----------
+
+  Color _bg(TalkColors c) => c.dark ? Colors.black : const Color(0xFFF2F2F7);
+  Color _cardBg(TalkColors c) => c.dark ? const Color(0xFF1C1C1E) : Colors.white;
+
   @override
   Widget build(BuildContext context) {
     final c = TalkColors.of(context);
     final s = _s;
-    final white = c.dark ? c.infoCard : Colors.white;
+    final top = MediaQuery.paddingOf(context).top;
     return Scaffold(
-      backgroundColor: c.dark ? c.infoBg : const Color(0xFFF7F8FA),
-      appBar: talkStatusBar(context),
-      body: Column(children: [
-        // `.talk-info__top`
-        Container(
-          padding: const EdgeInsets.fromLTRB(4, 6, 4, 10),
-          decoration: BoxDecoration(color: c.dark ? const Color(0xFF111827) : Colors.white, border: Border(bottom: BorderSide(color: c.line))),
-          child: Row(children: [
-            GestureDetector(
-              onTap: () => Navigator.pop(context),
-              child: Container(
-                width: 40,
-                height: 40,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(color: c.dark ? const Color(0x0FFFFFFF) : const Color(0x0F000000), shape: BoxShape.circle),
-                child: TalkIcon(TalkSvg.back, size: 22, color: c.ink),
-              ),
-            ),
-            const SizedBox(width: 4),
-            Expanded(child: Text(_isDm ? 'Kişi bilgisi' : 'Grup bilgisi', style: talkText(16.8, FontWeight.w700, c.ink, letterSpacing: -0.3))),
-            const SizedBox(width: 44),
-          ]),
+      backgroundColor: _bg(c),
+      body: Stack(children: [
+        ListenableBuilder(
+          listenable: _c,
+          builder: (context, _) => ListView(
+            controller: _scroll,
+            padding: EdgeInsets.fromLTRB(0, top + 58, 0, MediaQuery.paddingOf(context).bottom + 30),
+            children: [
+              _hero(c, s),
+              _quickActions(c),
+              if (s == null)
+                Padding(padding: const EdgeInsets.all(40), child: Center(child: CupertinoActivityIndicator(color: c.muted)))
+              else ...[
+                _tabs(c),
+                ...switch (_currentTab) {
+                  'members' => _membersTab(c, s),
+                  'media' => _mediaTab(c, s),
+                  _ => _settingsTab(c, s),
+                },
+              ],
+            ],
+          ),
         ),
-        Expanded(
-          child: s == null
-              ? Center(child: Text('Yükleniyor…', style: talkText(16, FontWeight.w700, c.ink)))
-              : ListView(padding: const EdgeInsets.only(bottom: 28), children: [
-                  _hero(c, s),
-                  _quickCard(c, white),
-                  if (!_isDm) _actions(c, white),
-                  _myPhoto(c),
-                  _disappearRow(c, s),
-                  _media(c, s, white),
-                  if (!_isDm) ...[
-                    _block(c, white, 'Adminler', s.admins, true),
-                    _block(c, white, 'Üyeler', s.members, false),
-                    _card(c, white, TalkSvg.decisions, 'Kararlar', _decisions(c, s)),
-                    _card(c, white, TalkSvg.tasks, 'Görevler', _tasks(c, s)),
-                  ],
-                  _card(c, white, TalkSvg.clock, 'Aktivite', _activity(c, s)),
-                  if (s.channel['type'] == 'group') _leaveRow(c, white),
-                ]),
-        ),
+        _topBar(c, top),
       ]),
     );
   }
 
-  /// WhatsApp iOS bilgi ekranı: sohbette ara, sessize al, arşivle, favori
-  Widget _quickCard(TalkColors c, Color white) {
-    final id = widget.channel.id;
-    Widget tile(IconData i, String t, VoidCallback onTap, {bool last = false}) => InkWell(
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.only(left: 16),
-            child: Row(children: [
-              Icon(i, size: 22, color: c.ink),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Container(
-                  height: 48,
-                  alignment: Alignment.centerLeft,
-                  decoration: BoxDecoration(border: last ? null : Border(bottom: BorderSide(color: c.rowLine, width: 0.6))),
-                  child: Text(t, style: talkText(16, FontWeight.w400, c.ink)),
-                ),
-              ),
-            ]),
-          ),
-        );
-    return ListenableBuilder(
-      listenable: _c,
-      builder: (context, _) => Padding(
-        padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-        child: Material(
-          color: white,
-          borderRadius: BorderRadius.circular(14),
-          clipBehavior: Clip.antiAlias,
-          child: Column(children: [
-            tile(CupertinoIcons.search, 'Sohbette ara', () => Navigator.pop(context, 'search')),
-            tile(_c.muted.contains(id) ? CupertinoIcons.bell : CupertinoIcons.bell_slash,
-                _c.muted.contains(id) ? 'Bildirimleri aç' : 'Sessize al', () => _c.toggleMute(id)),
-            tile(_c.favourites.contains(id) ? CupertinoIcons.star_fill : CupertinoIcons.star,
-                _c.favourites.contains(id) ? 'Favorilerden çıkar' : 'Favorilere ekle', () => _c.toggleFavourite(id)),
-            tile(CupertinoIcons.archivebox, _c.archived.contains(id) ? 'Arşivden çıkar' : 'Sohbeti arşivle', () => _c.toggleArchive(id), last: true),
-          ]),
-        ),
-      ),
-    );
-  }
-
-  /// WhatsApp'taki kırmızı "Gruptan çık" satırı
-  Widget _leaveRow(TalkColors c, Color white) => Padding(
-        padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-        child: Material(
-          color: white,
-          borderRadius: BorderRadius.circular(12),
-          child: ListTile(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            leading: const Icon(Icons.logout, color: Color(0xFFE11D48)),
-            title: Text('Gruptan çık', style: talkText(15, FontWeight.w600, const Color(0xFFE11D48))),
-            onTap: _leave,
-          ),
-        ),
-      );
-
-  Future<void> _leave() async {
-    final ok = await showCupertinoDialog<bool>(
-      context: context,
-      builder: (ctx) => CupertinoAlertDialog(
-        title: Text('"${widget.channel.name}" grubundan çıkılsın mı?'),
-        content: const Text('Bu gruptan artık mesaj almayacaksın.'),
-        actions: [
-          CupertinoDialogAction(onPressed: () => Navigator.pop(ctx, false), child: const Text('İptal')),
-          CupertinoDialogAction(isDestructiveAction: true, onPressed: () => Navigator.pop(ctx, true), child: const Text('Çık')),
-        ],
-      ),
-    );
-    if (ok != true || !mounted) return;
-    try {
-      await _c.leaveChannel(widget.channel);
-      if (!mounted) return;
-      talkToast(context, 'Gruptan çıktın');
-      Navigator.of(context).pop('left');
-    } on ArconApiException catch (e) {
-      if (mounted) talkToast(context, e.message.isEmpty ? 'Gruptan çıkılamadı' : e.message, error: true);
-    }
-  }
-
-  /// `.talk-info__hero` (telefon: ortalı, 120px avatar)
-  Widget _hero(TalkColors c, TalkSidebar s) {
-    final peer = s.channel['peer'] is Map ? TalkUser.fromJson((s.channel['peer'] as Map).cast<String, dynamic>()) : null;
-    final photo = s.avatarPath.isNotEmpty ? s.avatarPath : (peer?.avatarPath ?? '');
-    final input = InputDecoration(
-      isDense: true,
-      filled: _canManage,
-      fillColor: c.accentSoft,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: _canManage ? c.line : Colors.transparent)),
-      enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: _canManage ? c.line : Colors.transparent)),
-      disabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Colors.transparent)),
-    );
-    // web: ch.member_count (sidebar kanalında yok) || admins + members
-    final total = (s.channel['member_count'] as num?)?.toInt() ?? (s.admins.length + s.members.length);
-    final official = s.channel['type'] == 'department' && s.channel['is_private'] != true ? ' · Resmî grup' : '';
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 28, 18, 18),
-      child: Column(children: [
-        GestureDetector(
-          onTap: _pickChannelAvatar,
-          child: SizedBox(
-            width: 120,
-            height: 120,
-            child: Stack(children: [
-              Container(
-                width: 120,
-                height: 120,
-                clipBehavior: Clip.antiAlias,
-                alignment: Alignment.center,
-                decoration: const BoxDecoration(
-                  color: Color(0xFFDBE4EE),
-                  shape: BoxShape.circle,
-                  boxShadow: [BoxShadow(color: Color(0x14000000), blurRadius: 10, offset: Offset(0, 2))],
-                ),
-                child: photo.isNotEmpty
-                    ? Image.network(_c.api.fileUrl(photo), fit: BoxFit.cover, width: 120, height: 120)
-                    : _isDm
-                        ? Text(talkInitials(s.name), style: talkText(35.2, FontWeight.w700, const Color(0xFF5B6B7C)))
-                        : const TalkIcon(TalkSvg.camera, size: 36, color: Color(0xFF5B6B7C)),
-              ),
-            ]),
-          ),
-        ),
-        const SizedBox(height: 10),
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 320),
-          child: Column(children: [
-            TextField(
-              controller: _name,
-              enabled: _canManage,
-              textAlign: TextAlign.center,
-              maxLength: 120,
-              style: talkText(21.6, FontWeight.w700, c.ink, letterSpacing: -0.4),
-              decoration: input.copyWith(counterText: '', hintText: 'Grup adı'),
-            ),
-            const SizedBox(height: 2),
-            Text(_isDm ? 'Direkt yazışma' : 'Grup · $total üye$official',
-                textAlign: TextAlign.center, style: talkText(13.76, FontWeight.w500, c.muted)),
-            const SizedBox(height: 2),
-            TextField(
-              controller: _desc,
-              enabled: _canManage,
-              textAlign: TextAlign.center,
-              maxLength: 255,
-              style: talkText(14.08, FontWeight.w400, _canManage ? c.ink : c.muted),
-              decoration: input.copyWith(counterText: '', hintText: 'Grup açıklaması ekle', hintStyle: talkText(14.08, FontWeight.w400, c.muted)),
-            ),
-            if (_canManage)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: GestureDetector(
-                  onTap: _saveChannel,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    decoration: BoxDecoration(color: const Color(0xFF111111), borderRadius: BorderRadius.circular(8)),
-                    child: Text('Kaydet', style: talkText(12.48, FontWeight.w700, Colors.white)),
-                  ),
-                ),
-              ),
-          ]),
-        ),
-      ]),
-    );
-  }
-
-  /// `.talk-info__actions` — Üye ekle / Üyeleri gör
-  Widget _actions(TalkColors c, Color white) {
-    Widget action(String svg, String label, VoidCallback onTap, {bool divider = false}) => Expanded(
-          child: InkWell(
+  /// Üstte geri ve "…"; aşağı kayınca ortada ad
+  Widget _topBar(TalkColors c, double top) {
+    Widget circle(Widget child, VoidCallback onTap, String tip, {double width = 44}) => Tooltip(
+          message: tip,
+          child: GestureDetector(
             onTap: onTap,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 14),
-              decoration: divider ? BoxDecoration(border: Border(right: BorderSide(color: c.line))) : null,
-              child: Column(children: [
-                Container(
-                  width: 44,
-                  height: 44,
-                  alignment: Alignment.center,
-                  decoration: const BoxDecoration(color: TalkColors.infoGreen, shape: BoxShape.circle),
-                  child: TalkIcon(svg, size: 18, color: Colors.white),
-                ),
-                const SizedBox(height: 8),
-                Text(label, style: talkText(12.8, FontWeight.w700, c.dark ? c.ink : TalkColors.infoGreenText)),
-              ]),
+              width: width,
+              height: 44,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: _cardBg(c),
+                borderRadius: BorderRadius.circular(22),
+                border: Border.all(color: c.dark ? const Color(0xFF2C2C2E) : const Color(0xFFE6E6E8)),
+                boxShadow: c.dark ? null : const [BoxShadow(color: Color(0x14000000), blurRadius: 10, offset: Offset(0, 3))],
+              ),
+              child: child,
             ),
           ),
         );
-    return Container(
-      decoration: BoxDecoration(color: white, border: Border(bottom: BorderSide(color: c.line))),
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 180),
+      padding: EdgeInsets.fromLTRB(16, top + 4, 16, 8),
+      color: _titleInBar ? _bg(c).withValues(alpha: 0.96) : Colors.transparent,
       child: Row(children: [
-        if (_canInvite) action(TalkSvg.userAdd, 'Üye ekle', _invite, divider: true),
-        action(TalkSvg.members, 'Üyeleri gör', () => Scrollable.ensureVisible(_membersKey.currentContext!, duration: const Duration(milliseconds: 250))),
+        circle(Icon(CupertinoIcons.chevron_left, size: 22, color: c.ink), () => Navigator.pop(context), 'Geri'),
+        Expanded(
+          child: AnimatedOpacity(
+            opacity: _titleInBar ? 1 : 0,
+            duration: const Duration(milliseconds: 150),
+            child: Text(_title, textAlign: TextAlign.center, maxLines: 1, overflow: TextOverflow.ellipsis, style: talkText(17, FontWeight.w600, c.ink)),
+          ),
+        ),
+        circle(Icon(Icons.more_horiz, size: 24, color: c.ink), _more, 'Diğer', width: 60),
       ]),
     );
   }
 
-  final _membersKey = GlobalKey();
-
-  /// `.talk-info__my-photo`
-  Widget _myPhoto(TalkColors c) => Padding(
-        padding: const EdgeInsets.fromLTRB(2, 0, 2, 14),
-        child: Material(
-          color: c.infoCard,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: BorderSide(color: c.popBorder)),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(14),
-            onTap: _pickMyAvatar,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-              child: Row(children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  clipBehavior: Clip.antiAlias,
-                  alignment: Alignment.center,
-                  decoration: const BoxDecoration(color: TalkColors.wa, shape: BoxShape.circle),
-                  child: _myAvatar.isNotEmpty
-                      ? Image.network(_c.api.fileUrl(_myAvatar), fit: BoxFit.cover, width: 48, height: 48)
-                      : Text(talkInitials(_c.me?.displayName ?? '?'), style: talkText(15.2, FontWeight.w800, Colors.white)),
-                ),
-                const SizedBox(width: 12),
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('Profil fotoğrafım', style: talkText(14.72, FontWeight.w700, c.ink)),
-                  const SizedBox(height: 2),
-                  Text('Fotoğraf ekle veya değiştir', style: talkText(12.48, FontWeight.w400, c.muted)),
-                ]),
-              ]),
-            ),
-          ),
-        ),
-      );
-
-  /// `.talk-disappear-row`
-  Widget _disappearRow(TalkColors c, TalkSidebar s) {
-    final on = s.disappearSec > 0;
+  Widget _hero(TalkColors c, TalkSidebar? s) {
+    final total = s == null ? widget.channel.memberCount : ((s.channel['member_count'] as num?)?.toInt() ?? s.people.length);
+    final sub = _isDm
+        ? (_peer?.username.isNotEmpty ?? false ? '@${_peer!.username}' : 'Birebir sohbet')
+        : 'Grup · ${total > 0 ? total : s?.people.length ?? 0} üye';
+    final desc = _isDm ? (_peer?.about ?? '') : (s?.description ?? widget.channel.description);
     return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Material(
-        color: on ? const Color(0x0F25D366) : (c.dark ? c.infoCard : Colors.white),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: BorderSide(color: on ? const Color(0x5925D366) : c.line),
-        ),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(12),
-          onTap: _disappear,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            child: Row(children: [
-              Container(
-                width: 36,
-                height: 36,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(color: const Color(0x1F25D366), borderRadius: BorderRadius.circular(10)),
-                child: const TalkIcon(TalkSvg.clock, size: 20, color: Color(0xFF128C7E)),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('Süreli mesajlar', style: dmSansLike(c)),
-                  const SizedBox(height: 2),
-                  Text(s.disappearLabel, style: talkText(12, FontWeight.w400, c.muted)),
-                ]),
-              ),
-              Text('›', style: talkText(20, FontWeight.w400, c.muted)),
-            ]),
-          ),
-        ),
-      ),
-    );
-  }
-
-  TextStyle dmSansLike(TalkColors c) => talkText(13.5, FontWeight.w600, c.ink);
-
-  /// `.talk-media` — Medya, bağlantılar ve dosyalar
-  Widget _media(TalkColors c, TalkSidebar s, Color white) {
-    final files = s.files;
-    return Container(
-      margin: const EdgeInsets.only(top: 10),
-      padding: const EdgeInsets.fromLTRB(0, 4, 0, 10),
-      decoration: BoxDecoration(color: white, border: Border(top: BorderSide(color: c.line))),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-        InkWell(
-          onTap: () => setState(() => _mediaOpen = !_mediaOpen),
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
-            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              SizedBox(width: 28, child: Padding(padding: const EdgeInsets.only(top: 2), child: TalkIcon(TalkSvg.media, size: 20, color: c.muted))),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('Medya, bağlantılar ve dosyalar', style: talkText(14.72, FontWeight.w700, c.ink, height: 1.3)),
-                  const SizedBox(height: 2),
-                  Row(children: [
-                    Text('${files.length}', style: talkText(13.44, FontWeight.w600, c.muted)),
-                    const SizedBox(width: 4),
-                    AnimatedRotation(turns: _mediaOpen ? 0.25 : 0, duration: const Duration(milliseconds: 150), child: Text('›', style: talkText(16, FontWeight.w400, c.muted, height: 1))),
-                  ]),
-                ]),
-              ),
-            ]),
-          ),
-        ),
-        if (!_mediaOpen)
-          Padding(padding: const EdgeInsets.fromLTRB(20, 8, 20, 12), child: Text('Henüz medya yok', style: talkText(13.44, FontWeight.w400, c.muted)))
-        else ...[
-          Container(
-            decoration: BoxDecoration(border: Border(top: BorderSide(color: c.line), bottom: BorderSide(color: c.line))),
-            child: Row(children: [
-              for (final (k, l) in const [('media', 'Medya'), ('links', 'Bağlantılar'), ('files', 'Dosyalar')])
-                Expanded(
-                  child: GestureDetector(
-                    onTap: () => setState(() => _tab = k),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(border: Border(bottom: BorderSide(color: _tab == k ? c.ink : Colors.transparent, width: 2))),
-                      child: Text(l, style: talkText(13.12, FontWeight.w700, _tab == k ? c.ink : c.muted)),
-                    ),
-                  ),
+      padding: const EdgeInsets.fromLTRB(24, 0, 24, 18),
+      child: Column(children: [
+        GestureDetector(
+          onTap: _canManage ? _pickChannelAvatar : null,
+          child: _isDm || _photo.isNotEmpty
+              ? TalkAvatar.solid(name: _title, photoUrl: _c.api.fileUrl(_photo), size: 150, fontSize: 46, personIfEmpty: true)
+              : Container(
+                  width: 150,
+                  height: 150,
+                  decoration: BoxDecoration(color: c.dark ? const Color(0xFF2C2C2E) : const Color(0xFFE5E5EA), shape: BoxShape.circle),
+                  child: Icon(CupertinoIcons.person_2_fill, size: 72, color: c.dark ? const Color(0xFF8E8E93) : const Color(0xFF8E8E93)),
                 ),
+        ),
+        const SizedBox(height: 14),
+        GestureDetector(
+          onTap: _canManage ? _editGroup : null,
+          child: Text(_title, textAlign: TextAlign.center, style: talkText(28, FontWeight.w700, c.ink, letterSpacing: -0.5, height: 1.15)),
+        ),
+        const SizedBox(height: 4),
+        Text(sub, textAlign: TextAlign.center, style: talkText(15, FontWeight.w400, c.muted)),
+        if (desc.trim().isNotEmpty) ...[
+          const SizedBox(height: 10),
+          GestureDetector(
+            onTap: () => setState(() => _descOpen = !_descOpen),
+            child: Column(children: [
+              Text(
+                desc.trim(),
+                textAlign: TextAlign.center,
+                maxLines: _descOpen ? null : 2,
+                overflow: _descOpen ? null : TextOverflow.ellipsis,
+                style: talkText(15, FontWeight.w400, c.dark ? const Color(0xFFD1D1D6) : const Color(0xFF3A3A3C), height: 1.4),
+              ),
+              if (!_descOpen && desc.trim().length > 70)
+                Text('Devamını okuyun', style: talkText(15, FontWeight.w600, c.ink, height: 1.4)),
             ]),
           ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(10, 12, 10, 6),
-            child: switch (_tab) {
-              'media' => Text('Medya yok', style: talkText(13.44, FontWeight.w400, c.muted)),
-              'links' => Text('Bağlantı yok', style: talkText(13.44, FontWeight.w400, c.muted)),
-              _ => files.isEmpty
-                  ? Text('Dosya yok', style: talkText(13.44, FontWeight.w400, c.muted))
-                  : Column(children: [
-                      for (final f in files)
-                        InkWell(
-                          borderRadius: BorderRadius.circular(10),
-                          onTap: () => openTalkFile(context, _c.api.fileUrl(f.path), f.origName),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
-                            child: Row(children: [
-                              Container(
-                                width: 36,
-                                height: 36,
-                                alignment: Alignment.center,
-                                decoration: BoxDecoration(color: c.dark ? c.accentSoft : const Color(0xFF111111), borderRadius: BorderRadius.circular(10)),
-                                child: TalkIcon(_fileSvg, size: 16, color: c.dark ? c.ink : Colors.white),
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(child: Text(f.origName, maxLines: 1, overflow: TextOverflow.ellipsis, style: talkText(13.76, FontWeight.w700, c.ink))),
-                              TalkIcon(TalkSvg.download, size: 14, color: c.muted),
-                            ]),
-                          ),
-                        ),
-                    ]),
-            },
-          ),
+        ] else if (_canManage) ...[
+          const SizedBox(height: 8),
+          GestureDetector(onTap: _editGroup, child: Text('Grup açıklaması ekle', style: talkText(15, FontWeight.w500, c.muted))),
         ],
       ]),
     );
   }
 
-  /// `.talk-info__block` — Adminler / Üyeler
-  Widget _block(TalkColors c, Color white, String title, List<TalkUser> people, bool admins) => Container(
-        key: admins ? null : _membersKey,
-        margin: const EdgeInsets.only(top: 10),
-        padding: const EdgeInsets.only(bottom: 10),
-        decoration: BoxDecoration(color: white, border: Border(top: BorderSide(color: c.line))),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-            child: Row(children: [
-              Text(title, style: talkText(14.72, FontWeight.w700, c.dark ? c.muted : TalkColors.infoGreen)),
-              const Spacer(),
-              if (_canManage)
-                GestureDetector(
-                  onTap: _invite,
-                  child: Container(
-                    width: 22,
-                    height: 22,
-                    alignment: Alignment.center,
-                    decoration: const BoxDecoration(color: Color(0x2E00A884), shape: BoxShape.circle),
-                    child: Text('+', style: talkText(16, FontWeight.w700, TalkColors.wa, height: 1)),
-                  ),
+  /// Ara / Paylaş / Ara (QR, Durum yok)
+  Widget _quickActions(TalkColors c) {
+    Widget btn(Widget icon, String label, VoidCallback onTap) => Expanded(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: onTap,
+            child: Column(children: [
+              Container(
+                width: 62,
+                height: 54,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: _cardBg(c),
+                  borderRadius: BorderRadius.circular(27),
+                  border: Border.all(color: c.dark ? const Color(0xFF2C2C2E) : const Color(0xFFE6E6E8)),
                 ),
-              const SizedBox(width: 6),
-              Text('${people.length}', style: talkText(13.6, FontWeight.w600, c.dark ? c.muted : TalkColors.infoGreen)),
+                child: icon,
+              ),
+              const SizedBox(height: 8),
+              Text(label, style: talkText(14, FontWeight.w400, c.ink)),
             ]),
           ),
-          for (final p in people) _person(c, p, admins),
+        );
+    final ink = c.ink;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 22),
+      child: Row(children: [
+        if (_isDm) ...[
+          btn(Icon(CupertinoIcons.phone, size: 24, color: ink), 'Sesli', () => _call(video: false)),
+          btn(Icon(CupertinoIcons.video_camera, size: 28, color: ink), 'Görüntülü', () => _call(video: true)),
+        ] else
+          btn(
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(CupertinoIcons.video_camera, size: 28, color: ink),
+              Icon(CupertinoIcons.chevron_down, size: 12, color: ink),
+            ]),
+            'Ara',
+            _call,
+          ),
+        btn(Icon(CupertinoIcons.share, size: 24, color: ink), 'Paylaş', _share),
+        btn(Icon(CupertinoIcons.search, size: 24, color: ink), 'Ara', () => Navigator.pop(context, 'search')),
+      ]),
+    );
+  }
+
+  Widget _tabs(TalkColors c) {
+    final tabs = [if (!_isDm) ('members', 'Üyeler'), ('media', 'Medya'), ('settings', 'Ayarlar')];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+        for (final (k, l) in tabs)
+          GestureDetector(
+            onTap: () => setState(() => _tab = k),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 150),
+              margin: const EdgeInsets.symmetric(horizontal: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 9),
+              decoration: BoxDecoration(
+                color: _currentTab == k ? _cardBg(c) : Colors.transparent,
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(color: _currentTab == k ? (c.dark ? const Color(0xFF2C2C2E) : const Color(0xFFE6E6E8)) : Colors.transparent),
+              ),
+              child: Text(l, style: talkText(16, _currentTab == k ? FontWeight.w600 : FontWeight.w500, _currentTab == k ? c.ink : c.muted)),
+            ),
+          ),
+      ]),
+    );
+  }
+
+  /// Beyaz yuvarlak kart (satırlar arası çizgi)
+  Widget _group(TalkColors c, List<Widget> rows, {double indent = 64}) => Container(
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        clipBehavior: Clip.antiAlias,
+        decoration: BoxDecoration(color: _cardBg(c), borderRadius: BorderRadius.circular(22)),
+        child: Column(children: [
+          for (var i = 0; i < rows.length; i++) ...[
+            rows[i],
+            if (i < rows.length - 1) Padding(padding: EdgeInsets.only(left: indent), child: Divider(height: 0.6, thickness: 0.6, color: c.rowLine)),
+          ],
         ]),
       );
 
-  Widget _person(TalkColors c, TalkUser p, bool asAdmin) {
-    final isMe = p.id == _c.me?.id;
-    final role = p.role == 'owner' ? 'Owner' : (p.role == 'admin' ? 'Admin' : 'Üye');
-    Widget op(String svg, String act, String tip) => Padding(
-          padding: const EdgeInsets.only(left: 6),
-          child: Tooltip(
-            message: tip,
-            child: GestureDetector(
-              onTap: () => _memberOp(act, p),
-              child: Container(
-                width: 30,
-                height: 30,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(color: c.infoCard, borderRadius: BorderRadius.circular(8), border: Border.all(color: c.line)),
-                child: TalkIcon(svg, size: 14, color: c.ink),
-              ),
-            ),
-          ),
-        );
-    final manage = (_s?.canManage ?? false) && !isMe && p.role != 'owner';
-    return Material(
-      color: c.accentSoft,
-      child: InkWell(
-      onTap: isMe ? null : () => _openMember(p),
+  /// Simgeli satır (Ayarlar)
+  Widget _row(TalkColors c, {IconData? icon, required String title, String? subtitle, String? value, Widget? trailing, VoidCallback? onTap, Color? color, bool chevron = true}) {
+    final ink = color ?? c.ink;
+    return InkWell(
+      onTap: onTap,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        padding: EdgeInsets.fromLTRB(icon == null ? 20 : 18, 13, 16, 13),
         child: Row(children: [
-          TalkAvatar.solid(name: p.displayName, photoUrl: _c.api.fileUrl(p.avatarPath), size: 48, fontSize: 13.12),
-          const SizedBox(width: 12),
+          if (icon != null) ...[Icon(icon, size: 24, color: ink), const SizedBox(width: 22)],
           Expanded(
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(p.displayName, maxLines: 1, overflow: TextOverflow.ellipsis, style: talkText(15.2, FontWeight.w600, c.ink, height: 1.25)),
-              const SizedBox(height: 2),
-              Text('$role${p.department.isNotEmpty ? ' · ${p.department}' : ''}', style: talkText(12.48, FontWeight.w400, c.muted)),
+              Text(title, style: talkText(17, FontWeight.w400, ink)),
+              if (subtitle != null) Text(subtitle, style: talkText(13.5, FontWeight.w400, c.muted, height: 1.3)),
             ]),
           ),
-          if (manage && asAdmin) ...[op(TalkSvg.user, 'demote', 'Üye yap'), op(TalkSvg.x, 'remove', 'Çıkar')],
-          if (manage && !asAdmin) ...[op(TalkSvg.shield, 'promote', 'Admin yap'), op(TalkSvg.x, 'remove', 'Çıkar')],
-          if (!manage && !isMe) op(TalkSvg.msg, 'dm', 'Mesaj gönder'),
+          if (value != null) Text(value, style: talkText(16, FontWeight.w400, c.muted)),
+          ?trailing,
+          if (chevron && trailing == null && onTap != null) ...[const SizedBox(width: 6), Icon(CupertinoIcons.chevron_right, size: 16, color: c.muted)],
         ]),
-      ),
       ),
     );
   }
 
-  // ---------- Kararlar / Görevler ----------
-  final _taskInput = TextEditingController();
+  List<Widget> _membersTab(TalkColors c, TalkSidebar s) {
+    final q = _memberQuery.text.trim().toLowerCase();
+    int rank(TalkUser p) => p.id == _meId ? 0 : (p.role == 'owner' ? 1 : (p.role == 'admin' ? 2 : 3));
+    final people = s.people.where((p) => q.isEmpty || '${p.displayName} ${p.username} ${p.department}'.toLowerCase().contains(q)).toList()
+      ..sort((a, b) {
+        final r = rank(a).compareTo(rank(b));
+        return r != 0 ? r : a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase());
+      });
+    String roleLabel(TalkUser p) => p.role == 'owner' ? 'Sahip' : (p.role == 'admin' ? 'Yönetici' : '');
 
-  int get _meId => _c.me?.id ?? 0;
+    Widget person(TalkUser p) {
+      final me = p.id == _meId;
+      final sub = p.department.trim().isNotEmpty ? p.department.trim() : p.about.trim();
+      return InkWell(
+        onTap: me ? null : () => _openMember(p),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 9, 16, 9),
+          child: Row(children: [
+            TalkAvatar.solid(name: p.displayName, photoUrl: _c.api.fileUrl(p.avatarPath), size: 40, personIfEmpty: true),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(me ? 'Siz' : p.displayName, maxLines: 1, overflow: TextOverflow.ellipsis, style: talkText(17, FontWeight.w400, c.ink)),
+                if (sub.isNotEmpty) Text(sub, maxLines: 1, overflow: TextOverflow.ellipsis, style: talkText(13.5, FontWeight.w400, c.muted)),
+              ]),
+            ),
+            if (roleLabel(p).isNotEmpty) Text(roleLabel(p), style: talkText(15, FontWeight.w400, c.muted)),
+            if (!me) ...[const SizedBox(width: 6), Icon(CupertinoIcons.chevron_right, size: 16, color: c.muted)],
+          ]),
+        ),
+      );
+    }
+
+    return [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(32, 0, 20, 8),
+        child: Row(children: [
+          Expanded(child: Text('${s.people.length} üye', style: talkText(17, FontWeight.w600, c.muted))),
+          Tooltip(
+            message: 'Üye ara',
+            child: GestureDetector(
+              onTap: () => setState(() {
+                _searchMembers = !_searchMembers;
+                if (!_searchMembers) _memberQuery.clear();
+              }),
+              child: Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(color: c.dark ? const Color(0xFF2C2C2E) : const Color(0xFFE5E5EA), shape: BoxShape.circle),
+                child: Icon(_searchMembers ? CupertinoIcons.xmark : CupertinoIcons.search, size: 18, color: c.ink),
+              ),
+            ),
+          ),
+        ]),
+      ),
+      if (_searchMembers)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+          child: CupertinoSearchTextField(
+            controller: _memberQuery,
+            autofocus: true,
+            placeholder: 'Üye ara',
+            onChanged: (_) => setState(() {}),
+          ),
+        ),
+      _group(c, [
+        if (_canInvite && q.isEmpty)
+          InkWell(
+            onTap: _invite,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 9, 16, 9),
+              child: Row(children: [
+                Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(color: c.dark ? const Color(0xFF2C2C2E) : const Color(0xFFF2F2F7), shape: BoxShape.circle),
+                  child: Icon(CupertinoIcons.add, size: 22, color: c.ink),
+                ),
+                const SizedBox(width: 12),
+                Text('Üye ekle', style: talkText(17, FontWeight.w400, c.ink)),
+              ]),
+            ),
+          ),
+        for (final p in people) person(p),
+        if (q.isEmpty) _row(c, icon: CupertinoIcons.list_bullet, title: 'Üye değişikliklerini görüntüle', onTap: () => _activitySheet(s)),
+      ]),
+      _boardCard(c, TalkSvg.decisions, 'Kararlar', _decisions(c, s)),
+      _boardCard(c, TalkSvg.tasks, 'Görevler', _tasks(c, s)),
+      _footer(c, s),
+    ];
+  }
+
+  void _openMedia(TalkSidebar s) => Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => TalkMediaScreen(controller: _c, channelId: widget.channel.id, files: s.files, restricted: s.restricted),
+      ));
+
+  /// Medya: galeri önizlemesi (4 sütun) ve "Medya, bağlantı ve belgeler" satırı
+  List<Widget> _mediaTab(TalkColors c, TalkSidebar s) {
+    final media = s.files.where((f) => f.isImage || f.isVideo).take(8).toList();
+    return [
+      _group(c, [
+        _row(c, icon: CupertinoIcons.photo_on_rectangle, title: 'Medya, bağlantı ve belgeler', value: '${s.files.length}', onTap: () => _openMedia(s)),
+        if (media.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+            child: GridView.count(
+              crossAxisCount: 4,
+              shrinkWrap: true,
+              // padding verilmezse ızgara ekranın güvenli alan boşluğunu (çentik/alt çubuk) ekler
+              padding: EdgeInsets.zero,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 3,
+              crossAxisSpacing: 3,
+              children: [
+                for (final f in media)
+                  GestureDetector(
+                    onTap: () => _openMedia(s),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(6),
+                      child: f.isImage
+                          ? Image.network(_c.api.fileUrl(f.path), fit: BoxFit.cover, errorBuilder: (_, _, _) => ColoredBox(color: c.dark ? const Color(0xFF2C2C2E) : const Color(0xFFE5E5EA)))
+                          : const ColoredBox(color: Color(0xFF1C1C1E), child: Center(child: Icon(CupertinoIcons.play_fill, color: Colors.white70))),
+                    ),
+                  ),
+              ],
+            ),
+          )
+        else
+          Padding(padding: const EdgeInsets.fromLTRB(20, 0, 20, 16), child: Text('Henüz fotoğraf veya video yok', style: talkText(14, FontWeight.w400, c.muted))),
+      ]),
+      _footer(c, s),
+    ];
+  }
+
+  List<Widget> _settingsTab(TalkColors c, TalkSidebar s) {
+    final id = widget.channel.id;
+    final muted = _c.muted.contains(id);
+    final fav = _c.favourites.contains(id);
+    final inLists = _c.lists.entries.where((e) => e.value.contains(id)).map((e) => e.key).toList();
+    return [
+      _group(c, [
+        _row(c, icon: CupertinoIcons.timer, title: 'Süreli mesajlar', value: s.disappearLabel, onTap: _disappear),
+        _row(
+          c,
+          icon: CupertinoIcons.lock_shield,
+          title: 'Sohbeti kilitle',
+          subtitle: 'Bu sohbeti bu cihazda kilitleyin ve gizleyin.',
+          trailing: CupertinoSwitch(value: _c.locked.contains(id), activeTrackColor: c.ink, onChanged: (_) => _toggleLock()),
+        ),
+        _row(c, icon: CupertinoIcons.shield_lefthalf_fill, title: 'Kısıtlı sohbet', value: s.restricted ? 'Açık' : 'Kapalı', onTap: _restrictedSheet),
+        _row(c, icon: CupertinoIcons.lock, title: 'Şifreleme', subtitle: 'Mesajlar şifreli bağlantıyla iletilir. Daha fazla bilgi', onTap: _encryptionSheet),
+        _row(
+          c,
+          icon: muted ? CupertinoIcons.bell_slash : CupertinoIcons.bell,
+          title: 'Bildirimler',
+          subtitle: muted ? 'Bu sohbet sessizde' : null,
+          trailing: CupertinoSwitch(value: !muted, activeTrackColor: c.ink, onChanged: (_) => _c.toggleMute(id)),
+        ),
+        _row(
+          c,
+          icon: CupertinoIcons.person_crop_circle,
+          title: 'Profil fotoğrafım',
+          subtitle: 'Fotoğraf ekle veya değiştir',
+          trailing: TalkAvatar.solid(name: _c.me?.displayName ?? '', photoUrl: _c.api.fileUrl(_myAvatar), size: 34, personIfEmpty: true),
+          onTap: _pickMyAvatar,
+        ),
+      ]),
+      if (!_isDm)
+        _group(c, [
+          _row(c, icon: CupertinoIcons.person_2, title: 'Benzer bir grup oluşturun', subtitle: 'Ekleyebileceğiniz veya çıkarabileceğiniz aynı üyelerle başlayın.', onTap: _similarGroup),
+          if (_canManage) _row(c, icon: CupertinoIcons.pencil, title: 'Grubu düzenle', subtitle: 'Grup adı, açıklama ve fotoğraf', onTap: _editGroup),
+        ]),
+      _group(c, [
+        _row(c, title: fav ? "Favoriler'den çıkar" : "Favoriler'e ekle", color: c.ink, chevron: false, onTap: () => _c.toggleFavourite(id)),
+        _row(c, title: 'Listeye ekle', subtitle: inLists.isEmpty ? null : inLists.join(', '), color: c.ink, chevron: false, onTap: () => showTalkListSheet(context, _c, id)),
+        _row(c, title: _c.archived.contains(id) ? 'Arşivden çıkar' : 'Sohbeti arşivle', color: c.ink, chevron: false, onTap: () => _c.toggleArchive(id)),
+        // kısıtlı sohbette dışa aktarma yok
+        if (!s.restricted) _row(c, title: 'Sohbeti dışa aktar', color: c.ink, chevron: false, onTap: _export),
+        _row(c, title: 'Sohbeti temizle', color: TalkColors.dangerSolid, chevron: false, onTap: _clearChat),
+      ], indent: 20),
+      _group(c, [
+        if (s.channel['type'] == 'group') _row(c, title: 'Gruptan çık', color: TalkColors.dangerSolid, chevron: false, onTap: _leave),
+        _row(c, title: 'Sohbeti sil', color: TalkColors.dangerSolid, chevron: false, onTap: _deleteChat),
+        _row(c, title: _isDm ? 'Kişiyi şikayet et' : 'Grubu şikayet et', color: TalkColors.dangerSolid, chevron: false, onTap: _report),
+      ], indent: 20),
+      _footer(c, s),
+    ];
+  }
+
+  /// "Oluşturan: Anıl / Oluşturulma zamanı: 30 Eyl 2025"
+  Widget _footer(TalkColors c, TalkSidebar s) {
+    if (_isDm) return const SizedBox.shrink();
+    const months = ['Oca', 'Şub', 'Mar', 'Nis', 'May', 'Haz', 'Tem', 'Ağu', 'Eyl', 'Eki', 'Kas', 'Ara'];
+    final by = '${s.channel['created_by_name'] ?? ''}';
+    final d = talkParseTime('${s.channel['created_at'] ?? ''}');
+    if (by.isEmpty && d == null) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(32, 0, 32, 8),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        if (by.isNotEmpty) Text('Oluşturan: $by', style: talkText(14, FontWeight.w400, c.muted)),
+        if (d != null) Text('Oluşturulma zamanı: ${d.day} ${months[d.month - 1]} ${d.year}', style: talkText(14, FontWeight.w400, c.muted)),
+      ]),
+    );
+  }
+
+  Future<void> _activitySheet(TalkSidebar s) => showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: Colors.transparent,
+        builder: (ctx) {
+          final c = TalkColors.of(ctx);
+          return Container(
+            constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(ctx).height * 0.7),
+            decoration: BoxDecoration(color: _bg(c), borderRadius: const BorderRadius.vertical(top: Radius.circular(22))),
+            child: SafeArea(
+              top: false,
+              child: ListView(shrinkWrap: true, padding: const EdgeInsets.fromLTRB(16, 18, 16, 16), children: [
+                Text('Üye değişiklikleri ve etkinlik', style: talkText(17, FontWeight.w600, c.ink)),
+                const SizedBox(height: 14),
+                _activity(c, s),
+              ]),
+            ),
+          );
+        },
+      );
+
+  // ---------- Kararlar / Görevler ----------
 
   Future<void> _board(Future<({List<TalkDecision> decisions, List<TalkTask> tasks})> Function() call) async {
     try {
@@ -713,9 +1085,30 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
     return d == null ? '' : talkDayLabel(d);
   }
 
+  Widget _boardCard(TalkColors c, String svg, String title, Widget body) => Container(
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+        decoration: BoxDecoration(color: _cardBg(c), borderRadius: BorderRadius.circular(22)),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(children: [
+            Container(
+              width: 34,
+              height: 34,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(color: c.dark ? const Color(0xFF2C2C2E) : const Color(0xFF111111), borderRadius: BorderRadius.circular(10)),
+              child: TalkIcon(svg, size: 17, color: Colors.white),
+            ),
+            const SizedBox(width: 12),
+            Text(title, style: talkText(17, FontWeight.w600, c.ink)),
+          ]),
+          const SizedBox(height: 10),
+          body,
+        ]),
+      );
+
   Widget _decisions(TalkColors c, TalkSidebar s) {
     if (s.decisions.isEmpty) {
-      return Text('Henüz karar yok. Bir mesaja dokunup "Karar olarak işaretle" diyebilirsin.', style: talkText(13.6, FontWeight.w400, c.muted));
+      return Text('Henüz karar yok. Bir mesaja basılı tutup "Karar olarak işaretle" diyebilirsin.', style: talkText(14, FontWeight.w400, c.muted));
     }
     return Column(children: [
       for (final d in s.decisions)
@@ -727,8 +1120,8 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
             child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Expanded(
                 child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(d.text, maxLines: 2, overflow: TextOverflow.ellipsis, style: talkText(13.6, FontWeight.w700, c.ink)),
-                  Text('${d.markedBy} · ${_shortDate(d.createdAt)}', style: talkText(12, FontWeight.w400, c.muted)),
+                  Text(d.text, maxLines: 2, overflow: TextOverflow.ellipsis, style: talkText(14.5, FontWeight.w600, c.ink)),
+                  Text('${d.markedBy} · ${_shortDate(d.createdAt)}', style: talkText(12.5, FontWeight.w400, c.muted)),
                 ]),
               ),
               if (d.userId == _meId || s.canManage)
@@ -755,7 +1148,7 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
     }
 
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text(total == 0 ? 'Görev yok' : (open == 0 ? 'Tüm görevler tamamlandı' : '$open açık görev'), style: talkText(14.4, FontWeight.w600, c.ink)),
+      Text(total == 0 ? 'Görev yok' : (open == 0 ? 'Tüm görevler tamamlandı' : '$open açık görev'), style: talkText(15, FontWeight.w500, c.ink)),
       if (total > 0) ...[
         const SizedBox(height: 8),
         ClipRRect(
@@ -764,7 +1157,7 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
             value: (total - open) / total,
             minHeight: 8,
             color: c.dark ? Colors.white : const Color(0xFF111111),
-            backgroundColor: c.dark ? const Color(0xFF2A3942) : const Color(0xFFE8E8E8),
+            backgroundColor: c.dark ? const Color(0xFF2C2C2E) : const Color(0xFFE8E8E8),
           ),
         ),
         const SizedBox(height: 6),
@@ -786,8 +1179,7 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
                     t.title,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: talkText(13.6, FontWeight.w500, t.done ? c.muted : c.ink)
-                        .copyWith(decoration: t.done ? TextDecoration.lineThrough : null),
+                    style: talkText(14.5, FontWeight.w400, t.done ? c.muted : c.ink).copyWith(decoration: t.done ? TextDecoration.lineThrough : null),
                   ),
                 ),
                 if (t.messageId > 0)
@@ -808,13 +1200,14 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
             controller: _taskInput,
             textInputAction: TextInputAction.done,
             onSubmitted: (_) => add(),
-            style: talkText(14, FontWeight.w400, c.ink),
+            onTapOutside: (_) => FocusManager.instance.primaryFocus?.unfocus(),
+            style: talkText(15, FontWeight.w400, c.ink),
             decoration: InputDecoration(
               isDense: true,
               hintText: 'Görev ekle',
-              hintStyle: talkText(14, FontWeight.w400, c.muted),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide(color: c.line)),
-              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide(color: c.line)),
+              hintStyle: talkText(15, FontWeight.w400, c.muted),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: c.line)),
+              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: c.line)),
             ),
           ),
         ),
@@ -837,30 +1230,8 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
     if (ok == true) await _board(() => _c.api.deleteTask(t.id));
   }
 
-  /// `.talk-info__card`
-  Widget _card(TalkColors c, Color white, String svg, String title, Widget body) => Container(
-        margin: const EdgeInsets.only(top: 10),
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
-        decoration: BoxDecoration(color: white, border: Border(top: BorderSide(color: c.line))),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          Row(children: [
-            Container(
-              width: 36,
-              height: 36,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(color: const Color(0xFF111111), borderRadius: BorderRadius.circular(10)),
-              child: TalkIcon(svg, size: 18, color: Colors.white),
-            ),
-            const SizedBox(width: 10),
-            Text(title, style: talkText(14.72, FontWeight.w800, c.ink, letterSpacing: -0.15)),
-          ]),
-          const SizedBox(height: 10),
-          body,
-        ]),
-      );
-
   Widget _activity(TalkColors c, TalkSidebar s) {
-    if (s.activity.isEmpty) return Text('Aktivite yok', style: talkText(13.6, FontWeight.w400, c.muted));
+    if (s.activity.isEmpty) return Text('Henüz değişiklik yok', style: talkText(14, FontWeight.w400, c.muted));
     String icon(String label) {
       final t = label.toLowerCase();
       if (RegExp(r'dosya|yükle|upload|file').hasMatch(t)) return _fileSvg;
@@ -872,28 +1243,28 @@ class _TalkInfoScreenState extends State<TalkInfoScreen> {
     return Column(children: [
       for (final a in s.activity)
         Padding(
-          padding: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.only(bottom: 10),
           child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Container(
-              width: 24,
-              height: 24,
+              width: 28,
+              height: 28,
               alignment: Alignment.center,
-              decoration: BoxDecoration(color: const Color(0xFF111111), borderRadius: BorderRadius.circular(7)),
-              child: TalkIcon(icon('${a['label'] ?? ''}'), size: 12, color: Colors.white),
+              decoration: BoxDecoration(color: c.dark ? const Color(0xFF2C2C2E) : const Color(0xFF111111), borderRadius: BorderRadius.circular(8)),
+              child: TalkIcon(icon('${a['label'] ?? ''}'), size: 13, color: Colors.white),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 10),
             Expanded(
               child: Text.rich(
                 TextSpan(children: [
-                  TextSpan(text: '${a['label'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.w700)),
+                  TextSpan(text: '${a['label'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.w600)),
                   if ('${a['preview'] ?? ''}'.trim().isNotEmpty)
                     TextSpan(
                         text: ' · ${'${a['preview']}'.replaceAll(RegExp(r'\[\[chip:[^\]]+\]\]'), '').replaceAll(RegExp(r'\[\[gif:[^\]]+\]\]'), '[GIF]').trim()}'),
                 ]),
-                style: talkText(12.8, FontWeight.w400, c.muted),
+                style: talkText(14, FontWeight.w400, c.ink),
               ),
             ),
-            Text(_clock('${a['created_at'] ?? ''}'), style: talkText(11.52, FontWeight.w400, c.muted)),
+            Text(_clock('${a['created_at'] ?? ''}'), style: talkText(12, FontWeight.w400, c.muted)),
           ]),
         ),
     ]);

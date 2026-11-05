@@ -1,5 +1,6 @@
 package net.arconai.arconnect
 
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 
-class MainActivity : FlutterActivity()
+// local_auth (Face ID / parmak izi ile sohbet kilidi) FlutterFragmentActivity ister
+class MainActivity : FlutterFragmentActivity()

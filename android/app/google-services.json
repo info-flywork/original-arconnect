@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "420257447438",
+    "project_id": "arconnect-a3a86",
+    "storage_bucket": "arconnect-a3a86.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:420257447438:android:c28e7e7b36b6113da3865f",
+        "android_client_info": {
+          "package_name": "net.arconai.arconnect"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBeuRfIFB_IvyshJ92grQosFY_wXDJMZnQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
